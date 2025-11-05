@@ -1,0 +1,23 @@
+{
+  "devices": [
+    {
+      "name": "iPhone1",
+      "udid": "YOUR_DEVICE_UDID_HERE",
+      "appium_port": 6001,
+      "wda_local_port": 8100,
+      "system_port": 8200,
+      "mjpeg_port": 9100
+    }
+  ],
+  "shared_config": {
+    "xcodeOrgId": "YOUR_XCODE_ORG_ID",
+    "xcodeSigningId": "iPhone Developer",
+    "updatedWDABundleID": "com.yourname.WebDriverAgentRunner",
+    "platformName": "iOS",
+    "automationName": "XCUITest",
+    "newCommandTimeout": 1000,
+    "showXcodeLog": true,
+    "useNewWDA": true,
+    "noReset": true
+  }
+}

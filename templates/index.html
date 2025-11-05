@@ -1,0 +1,70 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Instagram Bot Dashboard</title>
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>📱 Instagram Bot Dashboard</h1>
+            <button id="addDeviceBtn" class="btn btn-primary">+ Add Device</button>
+        </header>
+
+        <div id="devicesContainer" class="devices-grid">
+            <!-- Devices will be loaded here -->
+        </div>
+
+        <!-- Log Viewer Modal -->
+        <div id="logModal" class="modal">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h2 id="logModalTitle">Device Logs</h2>
+                    <button class="close" onclick="closeLogModal()">&times;</button>
+                </div>
+                <div class="modal-body">
+                    <div class="log-controls">
+                        <button onclick="refreshLogs()" class="btn btn-sm">🔄 Refresh</button>
+                        <button onclick="clearLogDisplay()" class="btn btn-sm">🗑️ Clear Display</button>
+                        <label>
+                            <input type="checkbox" id="autoScroll" checked> Auto-scroll
+                        </label>
+                    </div>
+                    <pre id="logContent" class="log-viewer">Loading logs...</pre>
+                </div>
+            </div>
+        </div>
+
+        <!-- Add Device Modal -->
+        <div id="addDeviceModal" class="modal">
+            <div class="modal-content modal-small">
+                <div class="modal-header">
+                    <h2>Add New Device</h2>
+                    <button class="close" onclick="closeAddDeviceModal()">&times;</button>
+                </div>
+                <div class="modal-body">
+                    <form id="addDeviceForm">
+                        <div class="form-group">
+                            <label>Device Name:</label>
+                            <input type="text" id="deviceName" placeholder="e.g., iPhone1" required>
+                        </div>
+                        <div class="form-group">
+                            <label>Device UDID:</label>
+                            <input type="text" id="deviceUdid" placeholder="e.g., f82e9b3341aac98d..." required>
+                            <small>Get UDID from Finder → Click iPhone → Click device name</small>
+                        </div>
+                        <div class="form-actions">
+                            <button type="button" onclick="closeAddDeviceModal()" class="btn">Cancel</button>
+                            <button type="submit" class="btn btn-primary">Add Device</button>
+                        </div>
+                    </form>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script src="/static/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,56 @@
+# Sensitive files - DO NOT COMMIT
+devices.json
+# Note: accounts.txt is tracked but changes after initial commit should not be pushed
+# After first push, run: git update-index --assume-unchanged accounts.txt
+
+# Logs and runtime data
+logs/
+*.log
+
+# Old/unused files
+archive/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Claude Code
+.claude/
+
+# OS
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Misc
+docs/
+scripts/
