@@ -1,0 +1,7 @@
+# Example accounts.txt format
+# Each line: username:password:email:phone
+# The bot will append created accounts to this file
+
+# Example entries (replace with your own):
+# john_doe_123:SecurePass123!:john@email.com:+15551234567
+# jane_smith_456:MyPassword456!:jane@email.com:+15559876543

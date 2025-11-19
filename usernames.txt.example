@@ -1,0 +1,9 @@
+# Example usernames.txt format
+# One username per line - bot will try these in order
+# If username is taken, bot will use Instagram's suggestions
+
+madison_grace_23
+emma_rose_official
+sophia_marie_x
+olivia_james_99
+ava_nicole_2025

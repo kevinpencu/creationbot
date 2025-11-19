@@ -1,7 +1,11 @@
 # Sensitive files - DO NOT COMMIT
 devices.json
-# Note: accounts.txt is tracked but changes after initial commit should not be pushed
-# After first push, run: git update-index --assume-unchanged accounts.txt
+
+# User-specific data files (use .example versions as templates)
+accounts.txt
+bios.txt
+usernames.txt
+container_tracking.json
 
 # Logs and runtime data
 logs/

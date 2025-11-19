@@ -17,6 +17,10 @@ import traceback
 import os
 import json
 import argparse
+import subprocess
+
+# Default IP rotation mode (will be overridden by command line argument)
+IP_ROTATION_MODE = 'potatso'
 
 # Try to import psutil for memory monitoring (optional)
 try:
@@ -92,16 +96,25 @@ def is_wda_crashed(error):
     error_str = str(error).lower()
     return ("econnrefused" in error_str and "8100" in error_str) or \
            "could not proxy command" in error_str or \
-           "connection refused" in error_str
+           "connection refused" in error_str or \
+           "session is either terminated" in error_str or \
+           "nosuchdrivererror" in error_str or \
+           "invalidsessionidexception" in error_str
 
 
-def restart_driver_session(options):
+def restart_driver_session(options, device_config):
     """Restart the Appium driver session after WDA crash"""
     global driver
 
     print("\n" + "="*60)
     print("⚠️  WDA CRASH DETECTED - Restarting driver session...")
     print("="*60)
+
+    udid = device_config['udid']
+    device_name = device_config['name']
+    wda_port = device_config['wda_local_port']
+    appium_port = device_config['appium_port']
+    appium_url = f"http://localhost:{appium_port}/wd/hub"
 
     # Try to quit existing session
     try:
@@ -111,23 +124,108 @@ def restart_driver_session(options):
     except:
         print("Old session already closed")
 
-    # Wait for WDA to fully stop
-    print("Waiting 5 seconds for WDA to clean up...")
-    time.sleep(5)
+    # Kill the xcodebuild process for this device (NOT iproxy - we need it to keep running)
+    # iproxy forwards localhost:wda_port to device:8100, so we must keep it alive
+    print(f"Killing xcodebuild process for device {udid}...")
+    try:
+        subprocess.run(f"pkill -9 -f 'xcodebuild.*{udid}'", shell=True)
+        print("✓ Killed xcodebuild process")
+    except:
+        pass
 
-    # Reconnect with retry logic
-    max_retries = 5
+    # Wait for cleanup
+    print("Waiting 3 seconds for cleanup...")
+    time.sleep(3)
+
+    # Check if iproxy is still running on the port (it should be)
+    print(f"Checking if iproxy is still running on port {wda_port}...")
+    try:
+        result = subprocess.run(f"lsof -ti:{wda_port}", shell=True, capture_output=True, text=True)
+        if result.stdout.strip():
+            print(f"✓ iproxy still running (PID: {result.stdout.strip()})")
+        else:
+            # iproxy is not running, need to restart it
+            print("⚠️  iproxy not running, restarting...")
+            iproxy_process = subprocess.Popen(
+                ["iproxy", str(wda_port), "8100", "-u", udid],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL
+            )
+            print(f"✓ Started iproxy (PID: {iproxy_process.pid})")
+            time.sleep(1)
+    except Exception as e:
+        print(f"Error checking/starting iproxy: {e}")
+
+    # Start WDA using xcodebuild
+    print(f"Starting WDA for {device_name}...")
+    wda_dir = '/Users/kevinpencu/Downloads/WebDriverAgent'
+    derived_data = f"/tmp/wda-{udid}"
+    logs_dir = '/Users/kevinpencu/PycharmProjects/IG Creation Bot/logs'
+
+    os.makedirs(logs_dir, exist_ok=True)
+    wda_log_file = open(f"{logs_dir}/wda_{device_name}_restart.log", "w")
+
+    try:
+        wda_process = subprocess.Popen(
+            [
+                "xcodebuild",
+                "-project", f"{wda_dir}/WebDriverAgent.xcodeproj",
+                "-scheme", "WebDriverAgentRunner",
+                "-configuration", "Debug",
+                "-destination", f"id={udid}",
+                "-derivedDataPath", derived_data,
+                "-allowProvisioningUpdates",
+                "test"
+            ],
+            stdout=wda_log_file,
+            stderr=subprocess.STDOUT,
+            preexec_fn=os.setsid,
+            cwd=wda_dir
+        )
+        print(f"✓ Started WDA xcodebuild (PID: {wda_process.pid})")
+    except Exception as e:
+        print(f"❌ Failed to start WDA: {e}")
+        raise Exception("Could not start WDA after crash")
+
+    # Wait for WDA to be ready
+    print(f"Waiting for WDA to be ready on port {wda_port}...")
+    wda_url = f"http://127.0.0.1:{wda_port}/status"
+    wda_ready = False
+    timeout = 90
+
+    start_time = time.time()
+    while time.time() - start_time < timeout:
+        try:
+            response = requests.get(wda_url, timeout=2)
+            if response.status_code == 200:
+                print(f"✓ WDA ready on port {wda_port}")
+                wda_ready = True
+                break
+        except:
+            pass
+        elapsed = int(time.time() - start_time)
+        if elapsed % 10 == 0 and elapsed > 0:
+            print(f"  Still waiting for WDA... ({elapsed}s)")
+        time.sleep(2)
+
+    if not wda_ready:
+        print(f"❌ WDA failed to start after {timeout} seconds")
+        raise Exception("WDA timeout after crash recovery")
+
+    # Reconnect to Appium
+    print(f"Reconnecting to Appium at {appium_url}...")
+    max_retries = 3
     for attempt in range(max_retries):
         try:
             print(f"Reconnection attempt {attempt + 1}/{max_retries}...")
-            driver = webdriver.Remote("http://localhost:6001/wd/hub", options=options)
+            driver = webdriver.Remote(appium_url, options=options)
             print("✓ Successfully reconnected to Appium!")
             print("="*60 + "\n")
             return driver
         except Exception as e:
             print(f"Reconnection failed: {e}")
             if attempt < max_retries - 1:
-                wait_time = 5 * (attempt + 1)  # Exponential backoff
+                wait_time = 5
                 print(f"Waiting {wait_time} seconds before retry...")
                 time.sleep(wait_time)
             else:
@@ -159,7 +257,7 @@ def execute_with_wda_recovery(func, options, *args, **kwargs):
             if is_wda_crashed(e):
                 print(f"WDA crash detected during {func.__name__} (attempt {attempt + 1}/{max_attempts})")
                 if attempt < max_attempts - 1:
-                    restart_driver_session(options)
+                    restart_driver_session(options, device_config)
                     time.sleep(2)  # Brief pause after restart
                 else:
                     print(f"❌ Failed to execute {func.__name__} after {max_attempts} WDA recovery attempts")
@@ -169,15 +267,77 @@ def execute_with_wda_recovery(func, options, *args, **kwargs):
                 raise
 
 
-def generate_random_username():
-    while True:
-        username = fake.word() + fake.word()
-        if not any(char.isdigit() for char in username):
-            username += "".join(random.choices(string.digits, k=2))
-        elif sum(char.isdigit() for char in username) == 1:
-            username += random.choice(string.digits)
-        if 12 <= len(username) <= 15:
-            return username
+def get_random_username_from_file():
+    """
+    Get a random username from usernames.txt
+    Deletes the username from the file immediately after selecting it
+    Returns username or None if file is empty
+    """
+    usernames_file = "usernames.txt"
+
+    try:
+        # Read all usernames
+        with open(usernames_file, 'r', encoding='utf-8') as f:
+            usernames = [line.strip() for line in f.readlines() if line.strip()]
+
+        if len(usernames) == 0:
+            print("❌ usernames.txt is empty!")
+            return None
+
+        # Pick random username
+        selected_username = random.choice(usernames)
+        print(f"Selected username from file: {selected_username}")
+
+        # Remove the selected username from list
+        usernames.remove(selected_username)
+
+        # Write back to file (overwrite)
+        with open(usernames_file, 'w', encoding='utf-8') as f:
+            f.write('\n'.join(usernames) + '\n' if usernames else '')
+
+        print(f"✓ Deleted '{selected_username}' from usernames.txt ({len(usernames)} remaining)")
+
+        return selected_username
+
+    except FileNotFoundError:
+        print("❌ usernames.txt not found! Please create this file with usernames.")
+        return None
+    except Exception as e:
+        print(f"Error reading usernames.txt: {e}")
+        return None
+
+
+def delete_username_from_file(username):
+    """
+    Thread-safe function to delete a username from usernames.txt
+    Used when Instagram says username already exists
+    """
+    import fcntl
+
+    usernames_file = "usernames.txt"
+
+    try:
+        with open(usernames_file, 'r+', encoding='utf-8') as f:
+            fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+
+            try:
+                usernames = [line.strip() for line in f.readlines() if line.strip()]
+
+                if username in usernames:
+                    usernames.remove(username)
+
+                    f.seek(0)
+                    f.truncate()
+                    f.write('\n'.join(usernames) + '\n' if usernames else '')
+                    f.flush()
+
+                    print(f"✓ Deleted '{username}' from usernames.txt (already exists on Instagram)")
+
+            finally:
+                fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+
+    except Exception as e:
+        print(f"Error deleting username from file: {e}")
 
 
 def buyNumber(provider, api_key):
@@ -292,13 +452,83 @@ def rotateIP():
     print("Rotating IP...")
     try:
         # Press home button first to ensure we're on home screen
+        print("Going to home screen...")
         driver.execute_script("mobile: pressButton", {"name": "home"})
-        time.sleep(0.5)  # Reduced from 1
+        time.sleep(2)  # Wait for home screen to fully load
 
+        # Check which IP rotation mode to use
+        if IP_ROTATION_MODE == "mobile_data":
+            # Mobile data mode: Use Shortcuts app to toggle airplane mode
+            print("Using Mobile Data mode - toggling airplane mode via Shortcuts...")
+
+            # Open Shortcuts app
+            print("Looking for Shortcuts app on home screen...")
+            shortcuts_found = False
+            for attempt in range(3):
+                try:
+                    driver.find_element(By.XPATH, '//*[@label="Shortcuts"]').click()
+                    shortcuts_found = True
+                    break
+                except:
+                    if attempt < 2:
+                        print(f"Shortcuts not found (attempt {attempt + 1}/3), pressing home and waiting...")
+                        driver.execute_script("mobile: pressButton", {"name": "home"})
+                        time.sleep(2)
+
+            if not shortcuts_found:
+                print("⚠️  Could not find Shortcuts app after 3 attempts")
+                return
+
+            time.sleep(1)
+            print("Shortcuts app opened")
+
+            # Click on the IP shortcut
+            print("Looking for 'IP' shortcut...")
+            ip_shortcut_found = False
+            for attempt in range(5):
+                try:
+                    ip_shortcut = driver.find_element(By.XPATH, '//*[@label="IP"]')
+                    ip_shortcut.click()
+                    ip_shortcut_found = True
+                    print("Clicked 'IP' shortcut")
+                    break
+                except:
+                    if attempt < 4:
+                        print(f"IP shortcut not found (attempt {attempt + 1}/5), waiting...")
+                        time.sleep(1)
+
+            if not ip_shortcut_found:
+                print("⚠️  Could not find IP shortcut")
+                return
+
+            # Wait for airplane mode toggle to complete (3 sec on + 3 sec off + buffer)
+            print("Waiting 5 seconds for airplane mode toggle to complete...")
+            time.sleep(5)
+
+            print("IP rotated via airplane mode toggle!")
+            # Stay in Shortcuts app - crane() will click IG shortcut from here
+            return
+
+        # Potatso mode (default)
         # Open Potatso by clicking on the app icon from home screen
         print("Looking for Potatso app on home screen...")
-        driver.find_element(By.XPATH, '//*[@label="Potatso"]').click()
-        time.sleep(0.8)  # Reduced from 2
+        potatso_found = False
+        for attempt in range(3):
+            try:
+                driver.find_element(By.XPATH, '//*[@label="Potatso"]').click()
+                potatso_found = True
+                break
+            except:
+                if attempt < 2:
+                    print(f"Potatso not found (attempt {attempt + 1}/3), pressing home and waiting...")
+                    driver.execute_script("mobile: pressButton", {"name": "home"})
+                    time.sleep(2)
+
+        if not potatso_found:
+            print("⚠️  Could not find Potatso app after 3 attempts")
+            return
+
+        time.sleep(1)
         print("Potatso app opened")
 
         # Find all proxy cells on the "Choose Proxy" screen
@@ -367,111 +597,129 @@ def rotateIP():
             pass
 
 
-def crane():
-    print("Crane")
+def get_next_container_number(udid):
+    """Get the next container number for a specific device UDID"""
+    container_tracking_file = "container_tracking.json"
+
+    # Load existing tracking data
     try:
-        driver.terminate_app("com.burbn.instagram")
-        print("Instagram app terminated")
-    except Exception as e:
-        print(f"Error terminating Instagram: {e}")
+        with open(container_tracking_file, 'r') as f:
+            tracking_data = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        tracking_data = {}
 
-    # Ensure we're on the home screen
-    driver.execute_script("mobile: pressButton", {"name": "home"})
-    time.sleep(2)
-    print("Returned to home screen")
+    # Get current container number for this device (default to 0 if not found)
+    current_number = tracking_data.get(udid, 0)
 
-    max_attempts = 5
+    # Increment for next container
+    next_number = current_number + 1
 
-    for attempt in range(max_attempts):
+    # Save updated number
+    tracking_data[udid] = next_number
+    with open(container_tracking_file, 'w') as f:
+        json.dump(tracking_data, f, indent=2)
+
+    print(f"Container number for device {udid[:8]}: {next_number}")
+    return next_number
+
+
+def crane():
+    """Create new Instagram container using iOS Shortcut"""
+    print("Creating new container using Shortcut...")
+
+    try:
+        # Always go to home and open Shortcuts to be safe
+        # (even in mobile_data mode, rotateIP might have failed)
+        driver.execute_script("mobile: pressButton", {"name": "home"})
+        time.sleep(1)
+        print("Returned to home screen")
+
+        # Open Shortcuts app
+        print("Opening Shortcuts app...")
         try:
-            # Locate the Instagram icon
-            instagram = driver.find_element(By.XPATH, '//*[@label="Instagram"]')
-            location = instagram.location
-            size = instagram.size
-            center_x = location['x'] + size['width'] / 2
-            center_y = location['y'] + size['height'] / 2
+            shortcuts_app = driver.find_element(By.XPATH, '//*[@label="Shortcuts"]')
+            shortcuts_app.click()
+            time.sleep(2)
+            print("Shortcuts app opened")
+        except Exception as e:
+            print(f"Error opening Shortcuts app: {e}")
+            # Try alternative method - activate app by bundle ID
+            try:
+                driver.activate_app("com.apple.shortcuts")
+                time.sleep(2)
+                print("Shortcuts app activated via bundle ID")
+            except Exception as e2:
+                print(f"Failed to open Shortcuts: {e2}")
+                return
 
-            # Perform a long press
-            print(f"Performing long press at: ({center_x}, {center_y})")
-            driver.execute_script('mobile: touchAndHold', {
-                'x': center_x,
-                'y': center_y,
-                'duration': 2
-            })
-            print("Long pressed on Instagram")
+        # Click on "IG" shortcut
+        print("Looking for 'IG' shortcut...")
+        max_attempts = 5
+        ig_clicked = False
 
-            # Click on Container
-            container_option = driver.find_element(By.XPATH, '//*[contains(@label,"Container")]')
-            container_option.click()
-            print("Clicked on Container option")
+        for attempt in range(max_attempts):
+            try:
+                ig_shortcut = driver.find_element(By.XPATH, '//*[@label="IG"]')
+                ig_shortcut.click()
+                print("Clicked on 'IG' shortcut")
+                ig_clicked = True
+                time.sleep(2)
+                break
+            except:
+                print(f"'IG' shortcut not found (attempt {attempt + 1}/{max_attempts}), waiting...")
+                time.sleep(1)
 
-            # Click on Settings
-            settings_option = driver.find_element(By.XPATH, '(//*[@label="Settings"])[2]')
-            settings_option.click()
-            print("Clicked on Settings")
-
-            # From here, proceed with creating a new container and deleting the old one
-            add = driver.find_element(By.XPATH, '//*[@label="Add"]')
-            add.click()
-
-            fivedigit = randrange(10000, 99999)
-            print(f"fivedigit: {fivedigit}")
-
-            inputBox = driver.find_element(By.XPATH, '//*[@value="Name"]')
-            addbot = driver.find_element(By.XPATH, '(//*[@label="Add"])[3]')
-            inputBox.send_keys(str(fivedigit))
-            addbot.click()
-            print("Added new container")
-
-            newcontainer = driver.find_element(By.XPATH, f'//*[@label="{fivedigit}"]')
-            newcontainer.click()
-            print("Clicked on new container")
-
-            makedefault = driver.find_element(By.XPATH, '//*[@label="Make Default Container"]')
-            makedefault.click()
-            print("Set new container as default")
-
-            # Navigate back and delete old container
-            driver.find_element(By.XPATH, '//*[@label="Instagram"]').click()
-            driver.find_element(By.XPATH, '//*[@label="Edit"]').click()
-            print("Navigated back to edit containers")
-
-            delete_attempts = 0
-            while delete_attempts < 5:
-                try:
-                    delete = driver.find_element(By.XPATH, '//*[contains(@label,"Delete")]')
-                    delete.click()
-                    time.sleep(1)
-                    confirm_delete = driver.find_element(By.XPATH, '//*[@label="Delete"]')
-                    confirm_delete.click()
-                    time.sleep(1)
-                    final_delete = driver.find_element(By.XPATH, '//*[@label="Delete"]')
-                    final_delete.click()
-                    print("Deleted old container")
-                    break
-                except Exception as e:
-                    print(f"Delete attempt {delete_attempts + 1} failed: {e}")
-                    delete_attempts += 1
-                    time.sleep(1)
-
-            if delete_attempts == 5:
-                print("Failed to delete old container after multiple attempts")
-
-            # Close Settings and open Instagram
-            driver.terminate_app("com.apple.Preferences")
-            print("Crane operation completed successfully")
+        if not ig_clicked:
+            print("Failed to find 'IG' shortcut")
+            driver.execute_script("mobile: pressButton", {"name": "home"})
             return
 
+        # Wait for container name popup to appear
+        print("Waiting for container name popup...")
+        time.sleep(2)
+
+        # Get next container number for this device
+        container_number = get_next_container_number(device_config['udid'])
+
+        # Find text input field and enter container number
+        try:
+            text_field = driver.find_element(By.XPATH, '//XCUIElementTypeTextField')
+            text_field.click()
+            time.sleep(0.5)
+            text_field.send_keys(str(container_number))
+            print(f"Entered container name: {container_number}")
+            time.sleep(0.5)
         except Exception as e:
-            print(f"Error during crane function (Attempt {attempt + 1}): {e}")
-            if attempt < max_attempts - 1:
-                print(f"Retrying... (Attempt {attempt + 1} of {max_attempts})")
-                # Return to home screen before next attempt
-                driver.execute_script("mobile: pressButton", {"name": "home"})
-                time.sleep(2)
-            else:
-                print("Failed to complete crane operation after multiple attempts")
-                return
+            print(f"Error entering container name: {e}")
+            driver.execute_script("mobile: pressButton", {"name": "home"})
+            return
+
+        # Click "Done" button
+        try:
+            done_button = driver.find_element(By.XPATH, '//*[@label="Done"]')
+            done_button.click()
+            print("Clicked 'Done' button")
+            time.sleep(3)  # Wait 3 seconds for shortcut to complete
+            print("Container creation completed")
+        except Exception as e:
+            print(f"Error clicking Done button: {e}")
+            driver.execute_script("mobile: pressButton", {"name": "home"})
+            return
+
+        # Return to home screen
+        driver.execute_script("mobile: pressButton", {"name": "home"})
+        time.sleep(1)
+        print("Returned to home screen")
+
+        print("✓ Container reset completed successfully using Shortcut!")
+
+    except Exception as e:
+        print(f"Error during container reset: {e}")
+        # Try to return to home screen
+        try:
+            driver.execute_script("mobile: pressButton", {"name": "home"})
+        except:
+            pass
 
 
 def click_didnt_get_code_button(log_coordinates=False):
@@ -495,13 +743,14 @@ def click_didnt_get_code_button(log_coordinates=False):
             pass
         print("=== END COORDINATE LOG ===\n")
 
-    # Strategy 1: Try to find button by label text
+    # Strategy 1: Try to find button by label text (including "Try another way")
     try:
-        button = driver.find_element(By.XPATH, '//*[@label="I didn\'t get the code" or @label="I didn\'t get the code." or contains(@label, "didn\'t get")]')
+        button = driver.find_element(By.XPATH, '//*[@label="I didn\'t get the code" or @label="I didn\'t get the code." or @label="Try another way" or contains(@label, "didn\'t get") or contains(@label, "another way")]')
         location = button.location
-        print(f"✓ Found button by label at position ({location['x']}, {location['y']})")
+        label = button.get_attribute('label')
+        print(f"✓ Found button by label at position ({location['x']}, {location['y']}): '{label}'")
         button.click()
-        print("Clicked 'I didn't get the code' button (found by label)")
+        print(f"Clicked '{label}' button (found by label)")
         return True
     except:
         print("Button not found by label, trying other methods...")
@@ -517,29 +766,31 @@ def click_didnt_get_code_button(log_coordinates=False):
                 # Check if coordinates are in the expected area (left side, middle-lower of screen)
                 # Increased tolerance and expanded search area
                 if location['x'] < 100 and 200 < location['y'] < 500:
-                    # Check if label contains relevant text
-                    if label and ('code' in label.lower() or 'didn' in label.lower()):
+                    # Check if label contains relevant text (including "Try another way")
+                    if label and ('code' in label.lower() or 'didn' in label.lower() or 'another' in label.lower() or 'way' in label.lower()):
                         print(f"✓ Found button by coordinates at ({location['x']}, {location['y']}) with label: '{label}'")
                         button.click()
-                        print(f"Clicked 'I didn't get the code' button (found at position {location['x']}, {location['y']})")
+                        print(f"Clicked '{label}' button (found at position {location['x']}, {location['y']})")
                         return True
             except:
                 continue
     except Exception as e:
         print(f"Error in coordinate-based search: {e}")
 
-    # Strategy 3: Look for any button with text containing "code" on the left side
+    # Strategy 3: Look for any button with text containing "code", "another", or "way" on the left side
     try:
         buttons = driver.find_elements(By.XPATH, '//XCUIElementTypeButton')
         for button in buttons:
             try:
                 label = button.get_attribute('label')
                 location = button.location
-                if label and 'code' in label.lower() and location['x'] < 150:
-                    print(f"✓ Found button with 'code' in label at ({location['x']}, {location['y']}): '{label}'")
-                    button.click()
-                    print(f"Clicked button with 'code' in label: {label}")
-                    return True
+                if label and location['x'] < 150:
+                    label_lower = label.lower()
+                    if 'code' in label_lower or 'another' in label_lower or 'way' in label_lower:
+                        print(f"✓ Found button with relevant text at ({location['x']}, {location['y']}): '{label}'")
+                        button.click()
+                        print(f"Clicked button: {label}")
+                        return True
             except:
                 continue
     except:
@@ -662,39 +913,6 @@ def mobileNumber(key):
                 continue
 
             if mobile_field and mobile_field.is_enabled():
-                # Check if Instagram auto-detected wrong country (non-US)
-                print("Checking for country code detection...")
-                try:
-                    # Look for country code text like "Estonia (+372)" or other non-US countries
-                    # Common countries to check: Estonia, Latvia, Lithuania, Netherlands, etc.
-                    country_keywords = ["Estonia", "Latvia", "Lithuania", "Netherlands", "Poland", "Finland",
-                                        "Sweden", "Denmark", "Norway", "Germany", "France", "Spain", "Italy",
-                                        "+372", "+371", "+370", "+31", "+48", "+358", "+46", "+45", "+47", "+49"]
-
-                    # Search for any elements containing these country indicators
-                    page_source = driver.page_source
-                    country_detected = None
-                    for keyword in country_keywords:
-                        if keyword in page_source and keyword != "United States" and keyword != "+1":
-                            country_detected = keyword
-                            break
-
-                    if country_detected:
-                        print(f"WARNING: Non-US country detected: {country_detected}")
-                        print("Raising exception to restart entire account creation process...")
-                        raise Exception(f"Non-US country detected: {country_detected}. Restarting with new proxy.")
-                    else:
-                        print("No non-US country code detected. Proceeding with US number...")
-                except Exception as e:
-                    if "Non-US country detected" in str(e):
-                        # Re-raise the country detection exception to trigger full restart
-                        # This should propagate to the main loop
-                        raise
-                    else:
-                        # Other exceptions during country check - just log and continue
-                        print(f"Error checking country code: {e}")
-                        print("Continuing anyway...")
-
                 print("Buying number")
                 buy = buyNumber("daisy", key)
                 print(f"Received from Daisy: {buy}")
@@ -708,19 +926,23 @@ def mobileNumber(key):
                 # Only clear if we're retrying (previous number failed)
                 if is_retry:
                     print("Clearing old phone number from field (retry after failed code)...")
-                    # Use .clear() method like username (fast, instant clearing)
-                    mobile_field.clear()
+                    # Click field to focus it
+                    mobile_field.click()
                     time.sleep(0.3)
-                    print("Old number cleared")
+                    # Send 14 backspaces very fast to clear the old number
+                    print("Sending 14 backspaces to clear field...")
+                    for _ in range(14):
+                        mobile_field.send_keys('\b')  # Send backspace very fast (no delay)
+                    print("✓ Field cleared with backspaces")
                 else:
                     print("First attempt - field should be empty")
+                    # Click field to focus it
+                    mobile_field.click()
+                    time.sleep(0.3)
 
-                mobile_field.click()
-                time.sleep(0.5)
-
-                print("Entering new number...")
-                mobile_field.send_keys("+" + number)  # Fast typing like password
-                print(f"Entered phone number: +{number}")
+                print("Entering new number with +1 prefix...")
+                mobile_field.send_keys("+1" + number)  # Always use +1 (US) prefix
+                print(f"Entered phone number: +1{number}")
 
                 # Verify the correct number was entered
                 time.sleep(0.5)
@@ -729,20 +951,122 @@ def mobileNumber(key):
 
                 random_delay(1, 3)  # Longer delay after entering the number
 
-                next_button = driver.find_element(By.XPATH, '//*[@label="Next"]')
-                if next_button.is_enabled():
-                    next_button.click()
-                    print("Clicked Next after entering phone number")
-                else:
-                    print("Next button not enabled after entering phone number")
-                    return False
+                # Try clicking Next up to 2 times (in case first click doesn't register)
+                next_click_attempts = 2
+                for next_attempt in range(next_click_attempts):
+                    next_button = driver.find_element(By.XPATH, '//*[@label="Next"]')
+                    if next_button.is_enabled():
+                        next_button.click()
+                        print(f"Clicked Next after entering phone number (attempt {next_attempt + 1}/{next_click_attempts})")
+                    else:
+                        print("Next button not enabled after entering phone number")
+                        return False
 
-                # Wait for loading to finish
-                print("Waiting for Instagram to process phone number...")
-                time.sleep(5)  # Initial wait for processing
+                    # Wait and check if we reach confirmation screen or see a popup
+                    print("Waiting to see if we reach confirmation screen or see a popup...")
+                    progress_detected = False
+                    for wait_check in range(10):  # Check for 10 seconds
+                        time.sleep(1)
 
-                # Wait for Loading button to disappear (max 15 seconds)
-                for _ in range(15):
+                        # Check for "incorrect number" error (means old number wasn't cleared)
+                        try:
+                            error_msg = driver.find_element(By.XPATH, '//*[contains(@label, "may be incorrect")]')
+                            if error_msg.is_displayed():
+                                print("⚠️  'Number may be incorrect' error - previous number wasn't cleared properly!")
+                                # Clear the field completely and retry with same number
+                                mobile_field = driver.find_element(By.XPATH, '//*[@label="Mobile number" or @label="Mobile Number" or @name="Mobile Number"]')
+                                mobile_field.clear()
+                                time.sleep(0.3)
+                                print("Cleared field, re-typing number...")
+                                mobile_field.send_keys("+1" + number)
+                                print(f"Re-entered phone number: +1{number}")
+                                time.sleep(1)
+                                # Click Next again
+                                next_button = driver.find_element(By.XPATH, '//*[@label="Next"]')
+                                next_button.click()
+                                print("Clicked Next again after clearing error")
+                                # Reset wait_check to start checking from beginning
+                                continue
+                        except:
+                            pass
+
+                        # Check if confirmation code screen appeared
+                        try:
+                            driver.find_element(By.XPATH, '//*[contains(@label, "Enter the confirmation code") or contains(@label, "Confirmation code")]')
+                            print(f"✓ Confirmation code screen appeared after {wait_check + 1} seconds")
+                            progress_detected = True
+                            break
+                        except:
+                            pass
+
+                        # Check if "Are you trying to log in?" popup appeared
+                        try:
+                            driver.find_element(By.XPATH, '//*[contains(@label, "Are you trying to log in?")]')
+                            print(f"✓ Login popup appeared after {wait_check + 1} seconds")
+                            progress_detected = True
+                            break
+                        except:
+                            pass
+
+                        # Check if "Make sure your device is nearby" popup appeared
+                        try:
+                            driver.find_element(By.XPATH, '//*[contains(@label, "Make sure") and contains(@label, "device")]')
+                            print(f"✓ Device nearby popup appeared after {wait_check + 1} seconds")
+                            progress_detected = True
+                            break
+                        except:
+                            pass
+
+                        # Check if Continue button appeared (from device nearby popup)
+                        try:
+                            continue_button = driver.find_element(By.XPATH, '//*[@label="Continue"]')
+                            edit_button = driver.find_element(By.XPATH, '//*[@label="Edit number"]')
+                            if continue_button.is_displayed() and edit_button.is_displayed():
+                                print(f"✓ Device nearby popup detected via buttons after {wait_check + 1} seconds")
+                                progress_detected = True
+                                break
+                        except:
+                            pass
+
+                        # If at 10 seconds, check if still on mobile number screen
+                        if wait_check == 9:
+                            try:
+                                driver.find_element(By.XPATH, '//*[@label="Mobile number" or @label="Mobile Number" or @name="Mobile Number"]')
+                                print(f"Still on mobile number screen after 10 seconds (attempt {next_attempt + 1})")
+
+                                # Check for "Something went wrong" error - means account creation failed
+                                try:
+                                    something_wrong = driver.find_element(By.XPATH, '//*[contains(@label, "Something went wrong")]')
+                                    if something_wrong:
+                                        print("❌ 'Something went wrong. Please try again later.' error detected!")
+                                        print("Account creation failed - restarting process...")
+                                        return "restart"
+                                except:
+                                    pass
+
+                                progress_detected = False
+                            except:
+                                # Field not found, assume we moved somewhere
+                                print(f"Mobile field not found after 10 seconds - moved to different screen")
+                                progress_detected = True
+
+                    if progress_detected:
+                        # We detected progress (popup or confirmation screen)
+                        print("Progress detected, continuing...")
+                        break
+                    elif next_attempt < next_click_attempts - 1:
+                        # No progress - try clicking Next again
+                        print("No progress detected, retrying Next button click...")
+                    else:
+                        # Final attempt - continue anyway
+                        print("No clear progress after all Next attempts, continuing with flow...")
+
+                # Additional wait for any loading to finish
+                print("Waiting for Instagram to finish loading...")
+                time.sleep(2)
+
+                # Wait for Loading button to disappear (max 10 seconds)
+                for _ in range(10):
                     try:
                         loading = driver.find_element(By.XPATH, '//*[@label="Loading"]')
                         if loading.is_displayed():
@@ -754,7 +1078,7 @@ def mobileNumber(key):
                         # Loading button gone, good to proceed
                         break
 
-                random_delay(2, 3)
+                random_delay(1, 2)
 
                 # Check for "Make sure your device is nearby" popup
                 print("Checking for 'device nearby' popup...")
@@ -893,15 +1217,15 @@ def mobileNumber(key):
                                     return "restart"
                                 raise
 
-                        # Click "Send code to SMS"
+                        # Click "Send code via SMS" (note: "via" not "to")
                         try:
-                            send_sms_button = driver.find_element(By.XPATH, '//*[@label="Send code to SMS"]')
+                            send_sms_button = driver.find_element(By.XPATH, '//*[@label="Send code via SMS" or @label="Send code to SMS"]')
                             send_sms_button.click()
-                            print("Clicked 'Send code to SMS' - WhatsApp redirect handled")
+                            print("Clicked 'Send code via SMS' - WhatsApp redirect handled")
                             time.sleep(2)
                         except Exception as sms_err:
                             if is_wda_crashed(sms_err):
-                                print("⚠️  WDA CRASH detected during 'Send code to SMS' click!")
+                                print("⚠️  WDA CRASH detected during 'Send code via SMS' click!")
                                 return "restart"
                             raise
                 except Exception as wa_err:
@@ -995,8 +1319,8 @@ def mobileNumber(key):
                         send_sms_clicked = False
                         for sms_attempt in range(10):  # Increased to 10 attempts
                             try:
-                                # Check for all possible button labels
-                                send_sms_button = driver.find_element(By.XPATH, '//*[@label="Send code to SMS" or @label="Resend code to SMS" or @label="Resend confirmation code"]')
+                                # Check for all possible button labels (note: "via" not "to")
+                                send_sms_button = driver.find_element(By.XPATH, '//*[@label="Send code via SMS" or @label="Send code to SMS" or @label="Resend code to SMS" or @label="Resend confirmation code"]')
                                 send_sms_button.click()
                                 button_text = send_sms_button.get_attribute('label')
                                 print(f"Clicked '{button_text}'")
@@ -1040,32 +1364,19 @@ def mobileNumber(key):
                             print("Waiting for Instagram to process confirmation code...")
                             time.sleep(3)
 
-                            # Try to click Next button if available, or check if page auto-advanced
+                            # Click Next button ONCE
                             try:
                                 next_button = driver.find_element(By.XPATH, '//*[@label="Next"]')
                                 if next_button.is_enabled():
                                     next_button.click()
-                                    print("Clicked Next after entering code")
+                                    print("Clicked Next after entering SMS code")
                                 else:
                                     print("Next button not enabled, page may have auto-advanced")
                             except:
                                 print("Next button not found, page likely auto-advanced")
 
-                            # Wait for page transition to password screen
-                            print("Waiting for page to transition to next step...")
-                            time.sleep(3)
-
-                            # Verify we've moved to the next page by checking for password field
-                            for attempt in range(10):
-                                try:
-                                    password_field = driver.find_element(By.XPATH, '//*[@label="Password"]')
-                                    if password_field:
-                                        print("Successfully moved to password page")
-                                        break
-                                except:
-                                    print(f"Waiting for password page (attempt {attempt + 1}/10)...")
-                                    time.sleep(1)
-
+                            # Mobile number step complete - password() will handle detecting and filling password page
+                            print("SMS code step complete")
                             break
                         else:
                             print("No text fields found for code entry")
@@ -1164,11 +1475,6 @@ def mobileNumber(key):
 
                     continue
         except Exception as e:
-            # If this is a country detection exception, re-raise it to trigger full restart
-            if "Non-US country detected" in str(e):
-                print(f"Country detection exception caught in mobileNumber, re-raising...")
-                raise
-
             print(f"Error in mobile number step: {str(e)}")
             try:
                 print("Current page source:")
@@ -1180,49 +1486,99 @@ def mobileNumber(key):
 
 
 def password(accpw):
-    password_field = driver.find_element(By.XPATH, '//*[@label="Password"]')
-    password_field.click()
-    time.sleep(0.3)
-    password_field.send_keys(accpw)
-    print(f"Entered password")
-    time.sleep(1)  # Wait for Next button to become enabled
-
-    # Click Next button ONCE and wait for page transition
+    """
+    Handle password step:
+    - Immediately start checking for password page
+    - Once detected, type password and click Next
+    - If after 10 seconds still on password page, click Next again
+    """
     try:
-        next_button = driver.find_element(By.XPATH, '//*[@label="Next"]')
-        if next_button.is_enabled():
+        # Immediately start checking for password page
+        print("Checking for password page...")
+        password_field = None
+
+        for check_attempt in range(15):  # Check for up to 15 seconds
+            try:
+                password_field = driver.find_element(By.XPATH, '//*[@label="Password"]')
+                if password_field:
+                    print(f"✓ Password page detected after {check_attempt + 1} seconds")
+                    break
+            except:
+                if check_attempt < 14:
+                    print(f"  Waiting for password page... ({check_attempt + 1}/15)")
+                    time.sleep(1)
+
+        if not password_field:
+            print("❌ Password page not found after 15 seconds")
+            return False
+
+        # Type password (field is already activated after SMS code)
+        password_field.send_keys(accpw)
+        print("Entered password")
+        time.sleep(1)  # Wait for Next button to become enabled
+
+        # Click Next button
+        print("Clicking Next button...")
+        try:
+            next_button = driver.find_element(By.XPATH, '//*[@label="Next"]')
+            if next_button.is_enabled():
+                next_button.click()
+                print("Clicked Next button")
+            else:
+                print("⚠️  Next button not enabled, waiting...")
+                time.sleep(2)
+                next_button.click()
+                print("Clicked Next button (after wait)")
+        except Exception as e:
+            print(f"Error clicking Next: {e}")
+            return False
+
+        # Continuously check for page transition for 10 seconds
+        print("Checking for page transition (up to 10 seconds)...")
+        page_transitioned = False
+
+        for wait_check in range(10):
+            time.sleep(1)
+            try:
+                driver.find_element(By.XPATH, '//*[@label="Password"]')
+                # Still on password page
+                print(f"  Still on password page... ({wait_check + 1}/10)")
+            except:
+                # Password field gone - successfully moved to next page
+                print(f"✓ Successfully moved past password page after {wait_check + 1} seconds")
+                page_transitioned = True
+                break
+
+        if page_transitioned:
+            return True
+
+        # Still on password page after 10 seconds - click Next again
+        print("⚠️  Still on password page after 10 seconds, clicking Next again...")
+        try:
+            next_button = driver.find_element(By.XPATH, '//*[@label="Next"]')
             next_button.click()
-            print("Clicked Next after password")
+            print("Clicked Next button again")
 
-            # Wait 2 seconds for page transition (Instagram needs time to process password)
-            print("Waiting 2 seconds for page to transition...")
-            time.sleep(2)
-
-            # Verify we moved to next page (multiple checks for reliability)
-            for check_attempt in range(3):
+            # Continuously check for another 10 seconds
+            print("Checking for page transition (second attempt, up to 10 seconds)...")
+            for wait_check in range(10):
+                time.sleep(1)
                 try:
                     driver.find_element(By.XPATH, '//*[@label="Password"]')
-                    # Password field still exists
-                    if check_attempt < 2:
-                        print(f"Password field still visible (check {check_attempt + 1}/3), waiting longer...")
-                        time.sleep(2)
-                        continue
-                    else:
-                        print("Password field still visible after all checks - page may not have transitioned")
-                        # Don't return False - Instagram might have moved on anyway
-                        # The step order system will detect the actual current page
-                        return True
+                    print(f"  Still on password page... ({wait_check + 1}/10)")
                 except:
-                    # Password field gone, we successfully moved to next page
-                    print("Successfully moved to next page after password")
+                    print(f"✓ Successfully moved past password page on second attempt after {wait_check + 1} seconds")
                     return True
 
-            return True
-        else:
-            print("Next button not enabled")
+            print("❌ Still on password page after 2 Next button clicks")
             return False
+
+        except Exception as e:
+            print(f"Error clicking Next again: {e}")
+            return False
+
     except Exception as e:
-        print(f"Error clicking Next button: {e}")
+        print(f"Error in password step: {e}")
         return False
 
 
@@ -1375,7 +1731,12 @@ def doUsername():
     print("Waiting for username page to load...")
     time.sleep(2)
 
-    user = generate_random_username()
+    # Get username from file
+    user = get_random_username_from_file()
+
+    if not user:
+        print("❌ No username available from usernames.txt")
+        return False
 
     # Look for username field for 10 seconds total
     username_field = None
@@ -1408,22 +1769,70 @@ def doUsername():
         random_delay(1, 2)
 
         next_button = driver.find_element(By.XPATH, '//*[@label="Next"]')
+
+        # Try clicking Next up to 3 times
         next_click_attempts = 3
-        for _ in range(next_click_attempts):
+        for attempt in range(next_click_attempts):
             if next_button.is_enabled():
                 next_button.click()
-                print("Clicked Next after username")
-                random_delay(2, 4)
+                print(f"Clicked Next after username (attempt {attempt + 1}/{next_click_attempts})")
 
-                # Check if we're still on the username page (indicating the username wasn't accepted)
+                # First wait a moment for Instagram to process
+                time.sleep(2)
+
+                # Check for "is not available" error message
                 try:
-                    driver.find_element(By.XPATH, '//*[@label="Username"]')
-                    print("Still on username page. Username might not be available.")
-                    # Try a new username
-                    return doUsername()  # Recursive call with new username
+                    error_message = driver.find_element(By.XPATH, '//*[contains(@label, "is not available")]')
+                    if error_message.is_displayed():
+                        print(f"✗ Username '{user}' is not available (Instagram error message detected)")
+                        # Clear the field and try a new username
+                        try:
+                            username_field = driver.find_element(By.XPATH, '//*[@label="Username"]')
+                            username_field.clear()
+                            print("Cleared username field")
+                        except Exception as clear_error:
+                            print(f"Could not clear field: {clear_error}")
+                        # Username already deleted from file, recursively try another
+                        return doUsername()
                 except:
-                    print("Successfully moved past username page")
-                    return user  # Successfully entered username and moved to next page
+                    # No error message found, continue checking if page changed
+                    pass
+
+                # Wait up to 8 more seconds to see if we move to next page
+                print("Waiting to see if page transitions...")
+                page_changed = False
+                for wait_check in range(8):  # Check for 8 more seconds (2 + 8 = 10 total)
+                    time.sleep(1)
+                    try:
+                        # Check if we're still on username page
+                        driver.find_element(By.XPATH, '//*[@label="Username"]')
+                        # Still on username page after this second
+                        if wait_check == 7:  # After 8 more seconds (10 total)
+                            print(f"Still on username page after 10 seconds (attempt {attempt + 1})")
+                            page_changed = False
+                            break
+                    except:
+                        # Username field not found - we moved to next page!
+                        print(f"Successfully moved past username page after {wait_check + 3} seconds")
+                        page_changed = True
+                        break
+
+                if page_changed:
+                    # Username was accepted and already deleted from file
+                    return user  # Success!
+                elif attempt < next_click_attempts - 1:
+                    # Still on username page - try clicking Next again
+                    print(f"Retrying Next button click...")
+                    try:
+                        next_button = driver.find_element(By.XPATH, '//*[@label="Next"]')
+                    except:
+                        print("Next button not found for retry")
+                        break
+                else:
+                    # Final attempt failed - username not available on Instagram
+                    print(f"Username '{user}' already exists on Instagram")
+                    # Username was already deleted from file when we got it, so just try a new one
+                    return doUsername()
             else:
                 print("Next button not enabled, waiting...")
                 random_delay(1, 2)
@@ -1505,9 +1914,101 @@ def agree():
         agree_button.click()
         print("Clicked 'I agree'")
 
-        # Wait longer for page to load after 'I agree' - it takes longer than other steps
-        print("Waiting for page to load after 'I agree' (this takes longer than usual)...")
-        time.sleep(15)  # Much longer wait - Instagram takes time to load profile picture screen
+        # Wait for page to change after clicking "I agree", then check what page we landed on
+        print("Waiting for page to load after 'I agree'...")
+        page_loaded = False
+        page_type = None  # Will be "human_verification", "profile_picture", or "welcome"
+        max_wait_time = 20  # Maximum 20 seconds
+
+        for check_attempt in range(max_wait_time):
+            print(f"  Checking for page change... ({check_attempt + 1}/{max_wait_time})")
+
+            # Check for "Confirm that you're human" page
+            # Method 1: Page source check (most reliable)
+            try:
+                page_source = driver.page_source
+                if "Confirm that you" in page_source and "human" in page_source:
+                    page_type = "human_verification"
+                    page_loaded = True
+                    break
+            except:
+                pass
+
+            # Method 2: Look for "to use your account" text
+            try:
+                use_account = driver.find_element(By.XPATH, '//*[contains(@label, "to use your account")]')
+                if use_account:
+                    page_type = "human_verification"
+                    page_loaded = True
+                    break
+            except:
+                pass
+
+            # Check for profile picture screen (normal flow)
+            try:
+                add_pic = driver.find_element(By.XPATH, '//*[@label="Add picture" or @label="Skip"]')
+                if add_pic:
+                    page_type = "profile_picture"
+                    page_loaded = True
+                    break
+            except:
+                pass
+
+            # Check for welcome screen
+            try:
+                welcome = driver.find_element(By.XPATH, '//*[contains(@label, "Welcome to") or contains(@label, "fun")]')
+                if welcome:
+                    page_type = "welcome"
+                    page_loaded = True
+                    break
+            except:
+                pass
+
+            time.sleep(1)
+
+        # Handle based on what page we landed on
+        if page_type == "human_verification":
+            print("❌ CRITICAL: 'Confirm that you're human' page detected!")
+            print("This account has been flagged by Instagram")
+            print("Treating account as FAILED - will restart account creation")
+            return "human_verification_failed"
+        elif page_type == "profile_picture":
+            print(f"✓ Profile picture screen loaded successfully after {check_attempt + 1} seconds")
+        elif page_type == "welcome":
+            print(f"✓ Welcome screen loaded after {check_attempt + 1} seconds")
+        else:
+            # Page didn't load after 20 seconds - click I agree again
+            print(f"⚠️  Page didn't load after {max_wait_time} seconds, clicking 'I agree' again...")
+            try:
+                agree_button = driver.find_element(By.XPATH, '//*[@label="I agree" or @label="I Agree"]')
+                agree_button.click()
+                print("Clicked 'I agree' again")
+
+                # Check for page change again (up to 10 more seconds)
+                for retry_attempt in range(10):
+                    print(f"  Retry checking for page change... ({retry_attempt + 1}/10)")
+
+                    # Check for profile picture screen
+                    try:
+                        add_pic = driver.find_element(By.XPATH, '//*[@label="Add picture" or @label="Skip"]')
+                        if add_pic:
+                            print(f"✓ Profile picture screen loaded on retry after {retry_attempt + 1} seconds")
+                            break
+                    except:
+                        pass
+
+                    # Check for human verification
+                    try:
+                        page_source = driver.page_source
+                        if "Confirm that you" in page_source and "human" in page_source:
+                            print("❌ CRITICAL: 'Confirm that you're human' page detected!")
+                            return "human_verification_failed"
+                    except:
+                        pass
+
+                    time.sleep(1)
+            except:
+                print("Could not find 'I agree' button for retry")
 
         # Check for "Try again later" pop-up
         try:
@@ -1545,43 +2046,301 @@ def agree():
         return False
 
 
+def detect_profile_edit_screen():
+    """Detect what screen we're on during profile editing to handle popups"""
+    try:
+        page_source = driver.page_source
+
+        # Check for cookies popup
+        try:
+            allow_cookies = driver.find_element(By.XPATH, '//*[@label="Allow all cookies" or contains(@label, "Allow all cookies")]')
+            print("🔍 Detected: Cookies popup on screen")
+            return "cookies_popup"
+        except:
+            pass
+
+        # Check for notifications popup
+        try:
+            dont_allow = driver.find_element(By.XPATH, "//*[@label=\"Don't Allow\"]")
+            print("🔍 Detected: Notifications popup on screen")
+            return "notifications_popup"
+        except:
+            pass
+
+        # Check for "Create your avatar" popup
+        try:
+            not_now = driver.find_element(By.XPATH, '//*[@label="Not now" or @label="Not Now"]')
+            if "avatar" in page_source.lower():
+                print("🔍 Detected: Create avatar popup on screen")
+                return "avatar_popup"
+        except:
+            pass
+
+        # Check for Links page (BEFORE checking Edit Profile page)
+        # Links page shows "Add external link" button
+        try:
+            add_external = driver.find_element(By.XPATH, '//*[@label="Add external link"]')
+            print("🔍 Detected: Links page (showing add external link)")
+            return "links_page"
+        except:
+            pass
+
+        # Check for URL input field
+        try:
+            text_field = driver.find_element(By.XPATH, '//XCUIElementTypeTextField')
+            if "url" in page_source.lower() or "link" in page_source.lower():
+                print("🔍 Detected: URL input field visible")
+                return "url_input"
+        except:
+            pass
+
+        # Check for Edit Profile page
+        # The most reliable way is to check for the "Edit profile" header text
+        # Combined with checking that we're NOT on Links page (no "Add external link")
+
+        # First, make sure we're NOT on Links page
+        try:
+            driver.find_element(By.XPATH, '//*[@label="Add external link"]')
+            # If we found "Add external link", we're on Links page, not Edit Profile
+            # Skip Edit Profile detection
+        except:
+            # Good, we're not on Links page, continue checking for Edit Profile
+
+            # Method 1: Check for "Edit profile" header/title
+            edit_profile_header_found = False
+            try:
+                # Look for "Edit profile" as navigation bar title or static text
+                driver.find_element(By.XPATH, '//XCUIElementTypeNavigationBar[@name="Edit profile"] | //XCUIElementTypeStaticText[@label="Edit profile" or @value="Edit profile"]')
+                edit_profile_header_found = True
+                print("🔍 Detected: Edit Profile page (header found)")
+                return "edit_profile"
+            except:
+                pass
+
+            # Method 2: Check for Bio field to be truly on Edit Profile page (not Links page)
+            # Try multiple methods to detect Bio field
+            bio_found = False
+
+            # Look for Bio as XCUIElementTypeButton
+            try:
+                driver.find_element(By.XPATH, '//XCUIElementTypeButton[@label="Bio"]')
+                bio_found = True
+            except:
+                pass
+
+            # Look for Bio as any element type
+            if not bio_found:
+                try:
+                    driver.find_element(By.XPATH, '//*[@label="Bio"]')
+                    bio_found = True
+                except:
+                    pass
+
+            # Look for Bio as StaticText
+            if not bio_found:
+                try:
+                    driver.find_element(By.XPATH, '//XCUIElementTypeStaticText[@label="Bio"]')
+                    bio_found = True
+                except:
+                    pass
+
+            if bio_found:
+                # Also check for other Edit Profile elements to be sure
+                # Check for Name field
+                try:
+                    driver.find_element(By.XPATH, '//XCUIElementTypeButton[@label="Name"] | //XCUIElementTypeStaticText[@label="Name"] | //*[@label="Name"]')
+                    print("🔍 Detected: Edit Profile page (Bio + Name found)")
+                    return "edit_profile"
+                except:
+                    pass
+
+                # Check for Username field
+                try:
+                    driver.find_element(By.XPATH, '//XCUIElementTypeButton[@label="Username"] | //XCUIElementTypeStaticText[@label="Username"] | //*[@label="Username"]')
+                    print("🔍 Detected: Edit Profile page (Bio + Username found)")
+                    return "edit_profile"
+                except:
+                    pass
+
+                # Check for Pronouns field
+                try:
+                    driver.find_element(By.XPATH, '//XCUIElementTypeButton[@label="Pronouns"] | //XCUIElementTypeStaticText[@label="Pronouns"] | //*[@label="Pronouns"]')
+                    print("🔍 Detected: Edit Profile page (Bio + Pronouns found)")
+                    return "edit_profile"
+                except:
+                    pass
+
+                # Check for Links field (with count indicator like "1")
+                try:
+                    driver.find_element(By.XPATH, '//XCUIElementTypeButton[@label="Links"] | //XCUIElementTypeStaticText[@label="Links"]')
+                    print("🔍 Detected: Edit Profile page (Bio + Links field found)")
+                    return "edit_profile"
+                except:
+                    pass
+
+                # Check for "Edit picture or avatar" text (unique to Edit Profile page)
+                try:
+                    driver.find_element(By.XPATH, '//*[contains(@label, "Edit picture") or contains(@label, "Edit avatar")]')
+                    print("🔍 Detected: Edit Profile page (Bio + Edit picture found)")
+                    return "edit_profile"
+                except:
+                    pass
+
+                # If Bio exists but we can't confirm other fields, still assume Edit Profile
+                print("🔍 Detected: Page with Bio field (assuming Edit Profile)")
+                return "edit_profile"
+
+        # Check for Profile page
+        try:
+            edit_profile = driver.find_element(By.XPATH, '//*[@label="Edit profile"]')
+            print("🔍 Detected: Profile page")
+            return "profile"
+        except:
+            pass
+
+        print("🔍 Screen detection: Unknown screen")
+        return None
+    except Exception as e:
+        print(f"Error detecting screen: {e}")
+        return None
+
+
+def handle_popups_during_link_addition():
+    """Handle any popups that appear during link addition process"""
+    handled = False
+
+    # Check for cookies popup
+    try:
+        allow_cookies = driver.find_element(By.XPATH, '//*[@label="Allow all cookies" or contains(@label, "Allow all cookies")]')
+        allow_cookies.click()
+        print("✓ Dismissed cookies popup during link addition")
+        handled = True
+        time.sleep(1)
+        return True
+    except:
+        pass
+
+    # Check for notifications popup
+    try:
+        dont_allow = driver.find_element(By.XPATH, "//*[@label=\"Don't Allow\"]")
+        dont_allow.click()
+        print("✓ Dismissed notifications popup during link addition")
+        handled = True
+        time.sleep(1)
+        return True
+    except:
+        pass
+
+    # Check for "Not Now" buttons
+    try:
+        not_now = driver.find_element(By.XPATH, '//*[@label="Not Now" or @label="Not now"]')
+        not_now.click()
+        print("✓ Dismissed 'Not Now' popup during link addition")
+        handled = True
+        time.sleep(1)
+        return True
+    except:
+        pass
+
+    return handled
+
+
 def addOnlyFansLink():
     """Add OnlyFans link to Instagram profile"""
     try:
         print("Adding OnlyFans link to profile...")
 
-        # Click profile button (bottom right)
+        # Click profile button (bottom right) with multiple detection methods
         max_attempts = 10
         profile_clicked = False
         for attempt in range(max_attempts):
+            # Method 1: Look for Profile as XCUIElementTypeButton
             try:
-                # Try to find profile button by looking for tab bar at bottom
-                # Profile tab is usually the rightmost icon
-                profile_button = driver.find_element(By.XPATH, '//*[@label="Profile"]')
+                profile_button = driver.find_element(By.XPATH, '//XCUIElementTypeButton[@label="Profile"]')
                 profile_button.click()
-                print("Clicked profile button")
+                print("Clicked profile button (Method 1: Button)")
                 profile_clicked = True
                 time.sleep(2)
                 break
             except:
-                print(f"Profile button not found (attempt {attempt + 1}/{max_attempts}), waiting...")
-                time.sleep(1)
+                pass
+
+            # Method 2: Look for Profile as StaticText
+            try:
+                profile_button = driver.find_element(By.XPATH, '//XCUIElementTypeStaticText[@label="Profile"]')
+                profile_button.click()
+                print("Clicked profile button (Method 2: StaticText)")
+                profile_clicked = True
+                time.sleep(2)
+                break
+            except:
+                pass
+
+            # Method 3: Look for Profile as any element type
+            try:
+                profile_button = driver.find_element(By.XPATH, '//*[@label="Profile"]')
+                profile_button.click()
+                print("Clicked profile button (Method 3: Any element)")
+                profile_clicked = True
+                time.sleep(2)
+                break
+            except:
+                pass
+
+            # Method 4: Look for Profile by @name attribute
+            try:
+                profile_button = driver.find_element(By.XPATH, '//*[@name="Profile"]')
+                profile_button.click()
+                print("Clicked profile button (Method 4: @name)")
+                profile_clicked = True
+                time.sleep(2)
+                break
+            except:
+                pass
+
+            print(f"Profile button not found with any method (attempt {attempt + 1}/{max_attempts}), waiting...")
+            time.sleep(1)
 
         if not profile_clicked:
-            print("Could not find profile button")
+            print("Could not find profile button with any detection method")
+            print("🔍 Scanning screen to understand current state...")
+            detected = detect_profile_edit_screen()
             return False
 
         # Click "Edit profile" button
-        for attempt in range(5):
+        edit_profile_clicked = False
+        max_edit_attempts = 10
+        for attempt in range(max_edit_attempts):
+            # Check for and handle any popups
+            if attempt > 0:
+                print(f"Checking for popups before retry {attempt + 1}...")
+                handle_popups_during_link_addition()
+
             try:
                 edit_profile_button = driver.find_element(By.XPATH, '//*[@label="Edit profile"]')
                 edit_profile_button.click()
                 print("Clicked 'Edit profile'")
+                edit_profile_clicked = True
                 time.sleep(2)
                 break
             except:
-                print(f"Edit profile button not found (attempt {attempt + 1}/5), waiting...")
-                time.sleep(1)
+                print(f"Edit profile button not found (attempt {attempt + 1}/{max_edit_attempts})")
+
+                # Every 3 attempts, do a screen scan
+                if (attempt + 1) % 3 == 0:
+                    print("🔍 Performing screen scan...")
+                    detected = detect_profile_edit_screen()
+                    if detected in ["cookies_popup", "notifications_popup", "avatar_popup"]:
+                        print(f"Found blocking popup: {detected}, attempting to dismiss...")
+                        handle_popups_during_link_addition()
+
+                time.sleep(2)
+
+        if not edit_profile_clicked:
+            print("⚠️  Could not click Edit profile button")
+            print("🔍 Screen scan:")
+            detected = detect_profile_edit_screen()
+            print(f"Current screen state: {detected}")
 
         # Handle "Create your avatar" popup if it appears
         print("Checking for 'Create your avatar' popup...")
@@ -1627,65 +2386,287 @@ def addOnlyFansLink():
             print("No 'Create your avatar' popup found, continuing...")
 
         # Click "Links" row (look for "Add links" text or "Links" label)
-        for attempt in range(5):
+        # Increased retries and wait time to handle popups
+        links_clicked = False
+        max_link_attempts = 15
+        for attempt in range(max_link_attempts):
+            # First, check for and handle any popups
+            if attempt > 0:
+                print(f"Checking for popups before retry {attempt + 1}...")
+                handle_popups_during_link_addition()
+
             try:
                 links_button = driver.find_element(By.XPATH, '//*[@label="Links" or contains(@label, "Add links")]')
                 links_button.click()
                 print("Clicked 'Links'")
+                links_clicked = True
                 time.sleep(2)
                 break
             except:
-                print(f"Links button not found (attempt {attempt + 1}/5), waiting...")
-                time.sleep(1)
+                print(f"Links button not found (attempt {attempt + 1}/{max_link_attempts})")
+
+                # Every 5 attempts, do a comprehensive screen scan
+                if (attempt + 1) % 5 == 0:
+                    print("🔍 Performing comprehensive screen scan...")
+                    detected = detect_profile_edit_screen()
+                    if detected in ["cookies_popup", "notifications_popup", "avatar_popup"]:
+                        print(f"Found blocking popup: {detected}, attempting to dismiss...")
+                        handle_popups_during_link_addition()
+
+                time.sleep(2)  # Longer wait between retries
+
+        if not links_clicked:
+            print("❌ CRITICAL: Failed to click Links button after all attempts")
+            print("🔍 Final screen scan before giving up...")
+            detected = detect_profile_edit_screen()
+            print(f"Current screen state: {detected}")
+            return False
 
         # Click "Add external link"
-        for attempt in range(5):
+        add_link_clicked = False
+        max_add_link_attempts = 15
+        for attempt in range(max_add_link_attempts):
+            # Check for and handle any popups
+            if attempt > 0:
+                print(f"Checking for popups before retry {attempt + 1}...")
+                handle_popups_during_link_addition()
+
             try:
                 add_external_link = driver.find_element(By.XPATH, '//*[@label="Add external link"]')
                 add_external_link.click()
                 print("Clicked 'Add external link'")
+                add_link_clicked = True
                 time.sleep(2)
                 break
             except:
-                print(f"Add external link button not found (attempt {attempt + 1}/5), waiting...")
-                time.sleep(1)
+                print(f"Add external link button not found (attempt {attempt + 1}/{max_add_link_attempts})")
+
+                # Every 5 attempts, do a comprehensive screen scan
+                if (attempt + 1) % 5 == 0:
+                    print("🔍 Performing comprehensive screen scan...")
+                    detected = detect_profile_edit_screen()
+                    if detected in ["cookies_popup", "notifications_popup", "avatar_popup"]:
+                        print(f"Found blocking popup: {detected}, attempting to dismiss...")
+                        handle_popups_during_link_addition()
+
+                time.sleep(2)  # Longer wait between retries
+
+        if not add_link_clicked:
+            print("❌ CRITICAL: Failed to click Add external link after all attempts")
+            print("🔍 Final screen scan before giving up...")
+            detected = detect_profile_edit_screen()
+            print(f"Current screen state: {detected}")
+            return False
 
         # The URL field is already focused after clicking "Add external link"
         # Just type the OnlyFans link directly without clicking
-        try:
-            onlyfans_link = "onlyfans.com/uwumaddie/c46"
+        link_typed = False
+        onlyfans_link = "onlyfans.com/uwumaddie/c46"
+        max_typing_attempts = 10
 
-            # Find the text field and type directly
-            text_field = driver.find_element(By.XPATH, '//XCUIElementTypeTextField')
-            text_field.send_keys(onlyfans_link)  # Fast typing like password
-            print(f"Entered OnlyFans link: {onlyfans_link}")
-            time.sleep(1)
-        except Exception as e:
-            print(f"Error typing OnlyFans link: {e}")
+        for attempt in range(max_typing_attempts):
+            # Check for and handle any popups
+            if attempt > 0:
+                print(f"Checking for popups before retry {attempt + 1}...")
+                handle_popups_during_link_addition()
+
+            try:
+                # Find the text field and type directly
+                text_field = driver.find_element(By.XPATH, '//XCUIElementTypeTextField')
+                text_field.send_keys(onlyfans_link)  # Fast typing like password
+                print(f"Entered OnlyFans link: {onlyfans_link}")
+                link_typed = True
+                time.sleep(1)
+                break
+            except Exception as e:
+                print(f"Error typing OnlyFans link (attempt {attempt + 1}/{max_typing_attempts}): {e}")
+
+                # Every 3 attempts, do a comprehensive screen scan
+                if (attempt + 1) % 3 == 0:
+                    print("🔍 Performing comprehensive screen scan...")
+                    detected = detect_profile_edit_screen()
+                    if detected in ["cookies_popup", "notifications_popup", "avatar_popup"]:
+                        print(f"Found blocking popup: {detected}, attempting to dismiss...")
+                        handle_popups_during_link_addition()
+
+                time.sleep(2)  # Longer wait between retries
+
+        if not link_typed:
+            print("❌ CRITICAL: Failed to type OnlyFans link after all attempts")
+            print("🔍 Final screen scan before giving up...")
+            detected = detect_profile_edit_screen()
+            print(f"Current screen state: {detected}")
+            return False
 
         # Click "Done" button
-        for attempt in range(5):
+        done_clicked = False
+        max_done_attempts = 15
+        for attempt in range(max_done_attempts):
+            # Check for and handle any popups
+            if attempt > 0:
+                print(f"Checking for popups before retry {attempt + 1}...")
+                handle_popups_during_link_addition()
+
             try:
                 done_button = driver.find_element(By.XPATH, '//*[@label="Done"]')
                 done_button.click()
                 print("Clicked 'Done'")
-                time.sleep(2)
+                done_clicked = True
+                print("Waiting 3 seconds for page to settle after clicking Done...")
+                time.sleep(3)
                 break
             except:
-                print(f"Done button not found (attempt {attempt + 1}/5), waiting...")
+                print(f"Done button not found (attempt {attempt + 1}/{max_done_attempts})")
+
+                # Every 5 attempts, do a comprehensive screen scan
+                if (attempt + 1) % 5 == 0:
+                    print("🔍 Performing comprehensive screen scan...")
+                    detected = detect_profile_edit_screen()
+                    if detected in ["cookies_popup", "notifications_popup", "avatar_popup"]:
+                        print(f"Found blocking popup: {detected}, attempting to dismiss...")
+                        handle_popups_during_link_addition()
+
+                time.sleep(2)  # Longer wait between retries
+
+        if not done_clicked:
+            print("❌ CRITICAL: Failed to click Done button after all attempts - OnlyFans link was not saved")
+            print("🔍 Final screen scan before giving up...")
+            detected = detect_profile_edit_screen()
+            print(f"Current screen state: {detected}")
+            return False
+
+        # Navigate back to Edit profile page using back arrow (top left)
+        # Retry clicking back arrow if we're still on the Links page
+        print("Navigating back to Edit profile page...")
+
+        for back_attempt in range(3):
+            print(f"Clicking back arrow (attempt {back_attempt + 1}/3)...")
+            if click_back_arrow():
+                print("Clicked back arrow")
+            else:
+                print("Failed to click back arrow")
+
+            # Wait and check if we're on Edit Profile page
+            time.sleep(2)
+
+            # Check if Bio field is visible (means we're on Edit Profile page)
+            try:
+                bio_check = driver.find_element(By.XPATH, '//*[@label="Bio"]')
+                if bio_check:
+                    print("✓ Successfully navigated to Edit profile page")
+                    break
+            except:
+                # Bio not found, check if still on Links page
+                current_screen = detect_profile_edit_screen()
+                if current_screen == "links_page":
+                    print(f"⚠️  Still on Links page, clicking back arrow again...")
+                    continue
+                else:
+                    # On some other page, assume it's Edit Profile
+                    print(f"On screen: {current_screen}, continuing...")
+                    break
+
+        # Add bio
+        print("Adding bio to profile...")
+        try:
+            # Read random bio from bios.txt
+            with open("bios.txt", "r", encoding="utf-8") as f:
+                bios_content = f.read()
+
+            # Split by | to get individual bios
+            bios = [bio.strip() for bio in bios_content.split("|") if bio.strip()]
+
+            if len(bios) == 0:
+                print("No bios found in bios.txt")
+            else:
+                # Pick random bio
+                selected_bio = random.choice(bios)
+                print(f"Selected bio: {selected_bio[:50]}...")  # Print first 50 chars
+
+                # Click Bio field with retry logic and multiple detection methods
+                bio_field_clicked = False
+                for attempt in range(5):
+                    # Method 1: Look for Bio as XCUIElementTypeButton
+                    try:
+                        bio_field = driver.find_element(By.XPATH, '//XCUIElementTypeButton[@label="Bio"]')
+                        bio_field.click()
+                        print("Clicked Bio field (Method 1: Button)")
+                        bio_field_clicked = True
+                        time.sleep(1)
+                        break
+                    except:
+                        pass
+
+                    # Method 2: Look for Bio as StaticText
+                    try:
+                        bio_field = driver.find_element(By.XPATH, '//XCUIElementTypeStaticText[@label="Bio"]')
+                        bio_field.click()
+                        print("Clicked Bio field (Method 2: StaticText)")
+                        bio_field_clicked = True
+                        time.sleep(1)
+                        break
+                    except:
+                        pass
+
+                    # Method 3: Look for Bio as any element type
+                    try:
+                        bio_field = driver.find_element(By.XPATH, '//*[@label="Bio"]')
+                        bio_field.click()
+                        print("Clicked Bio field (Method 3: Any element)")
+                        bio_field_clicked = True
+                        time.sleep(1)
+                        break
+                    except:
+                        pass
+
+                    # Method 4: Look for Bio by @name attribute
+                    try:
+                        bio_field = driver.find_element(By.XPATH, '//*[@name="Bio"]')
+                        bio_field.click()
+                        print("Clicked Bio field (Method 4: @name)")
+                        bio_field_clicked = True
+                        time.sleep(1)
+                        break
+                    except:
+                        pass
+
+                    print(f"Bio field not found with any method (attempt {attempt + 1}/5), waiting...")
+                    time.sleep(1)
+
+                if not bio_field_clicked:
+                    print("⚠️  Could not find Bio field after 5 attempts with all methods")
+                    print("🔍 Running final screen detection to understand current state...")
+                    final_detection = detect_profile_edit_screen()
+                    print(f"Current screen: {final_detection}")
+                    print("✓ OnlyFans link was added successfully, returning True (skipping bio)")
+                    return True  # Still return True as link was added successfully
+
+                # Find the text view and enter bio
+                bio_text_view = driver.find_element(By.XPATH, '//XCUIElementTypeTextView')
+                bio_text_view.click()
+                time.sleep(0.5)
+
+                # Clear any existing text
+                bio_text_view.clear()
+                time.sleep(0.3)
+
+                # Enter bio (preserving line breaks)
+                bio_text_view.send_keys(selected_bio)
+                print("Entered bio")
                 time.sleep(1)
 
-        # Navigate back to main screen (click back button or home)
-        try:
-            # Try to find back button to return to profile
-            back_button = driver.find_element(By.XPATH, '//*[@label="Back"]')
-            back_button.click()
-            print("Navigated back from links screen")
-            time.sleep(1)
-        except:
-            print("Back button not found, assuming already on profile")
+                # Click Done at the top
+                done_button = driver.find_element(By.XPATH, '//*[@label="Done"]')
+                done_button.click()
+                print("Clicked 'Done' after bio")
+                time.sleep(2)
 
-        print("OnlyFans link successfully added to profile!")
+        except FileNotFoundError:
+            print("⚠️  bios.txt not found, skipping bio addition")
+        except Exception as e:
+            print(f"Error adding bio: {e}")
+
+        print("OnlyFans link and bio successfully added to profile!")
         return True
 
     except Exception as e:
@@ -1694,15 +2675,104 @@ def addOnlyFansLink():
 
 
 def skip_profile_picture():
-    """Skip the profile picture step"""
+    """Add a profile picture from Picz album"""
     try:
-        skip_button = driver.find_element(By.XPATH, '//*[@label="Skip"]')
-        skip_button.click()
-        print("Clicked 'Skip' on profile picture screen")
+        # Step 1: Click "Add picture" button
+        print("Looking for 'Add picture' button...")
+        add_picture_button = driver.find_element(By.XPATH, '//*[@label="Add picture"]')
+        add_picture_button.click()
+        print("Clicked 'Add picture'")
         time.sleep(2)
+
+        # Step 2: Click "Choose From Camera Roll"
+        print("Looking for 'Choose From Camera Roll'...")
+        camera_roll_button = driver.find_element(By.XPATH, '//*[@label="Choose From Camera Roll"]')
+        camera_roll_button.click()
+        print("Clicked 'Choose From Camera Roll'")
+        time.sleep(2)
+
+        # Step 3: Click on "Albums" tab (starts on "Photos" tab by default)
+        print("Switching to Albums tab...")
+        albums_tab = driver.find_element(By.XPATH, '//*[@label="Albums"]')
+        albums_tab.click()
+        print("Clicked 'Albums' tab")
+        time.sleep(1)
+
+        # Step 4: Click on "Picz" album
+        print("Looking for 'Picz' album...")
+        picz_album = driver.find_element(By.XPATH, '//*[@label="Picz"]')
+        picz_album.click()
+        print("Opened 'Picz' album")
+        time.sleep(5)  # Wait longer for album and photos to load
+
+        # Step 5: Get all photos and select one randomly
+        print("Finding all photos in album...")
+
+        # Scroll down to trigger photo grid loading
+        print("Scrolling down to load photos...")
+        try:
+            screen_size = driver.get_window_size()
+            # Swipe down to load photo grid
+            driver.execute_script("mobile: dragFromToForDuration", {
+                "fromX": screen_size['width'] / 2,
+                "fromY": screen_size['height'] * 0.8,
+                "toX": screen_size['width'] / 2,
+                "toY": screen_size['height'] * 0.3,
+                "duration": 0.5
+            })
+            time.sleep(2)
+            print("Scroll completed, photos should be loaded")
+        except Exception as scroll_err:
+            print(f"Scroll failed: {scroll_err}, continuing anyway...")
+
+        # Use Method 3 (Images) - this is what worked!
+        photo_cells = []
+        try:
+            images = driver.find_elements(By.XPATH, '//XCUIElementTypeImage')
+            print(f"Found {len(images)} images")
+            for img in images:
+                try:
+                    if img.is_displayed():
+                        size = img.size
+                        if size['width'] > 10 and size['height'] > 10:
+                            photo_cells.append(img)
+                except:
+                    pass
+        except Exception as e:
+            print(f"Error finding images: {e}")
+            return False
+
+        print(f"Total valid photos found: {len(photo_cells)}")
+
+        if len(photo_cells) > 0:
+            # Select random photo from valid cells
+            random_photo = random.choice(photo_cells)
+            print(f"Selecting random photo from {len(photo_cells)} available...")
+            random_photo.click()
+            print("✓ Selected random photo")
+            time.sleep(1)
+        else:
+            print("❌ No valid photos found")
+            return False
+
+        # Step 6: Click "Done" button
+        print("Looking for 'Done' button...")
+        done_button = driver.find_element(By.XPATH, '//*[@label="Done"]')
+        done_button.click()
+        print("Clicked 'Done' button")
+
+        # Step 7: Wait 5 seconds for Instagram to process the profile picture
+        time.sleep(5)
+        print("✓ Profile picture added successfully!")
         return True
+
     except Exception as e:
-        print(f"Error skipping profile picture: {e}")
+        print(f"Error adding profile picture: {e}")
+        # Try to go back to home if something failed
+        try:
+            driver.execute_script("mobile: pressButton", {"name": "home"})
+        except:
+            pass
         return False
 
 
@@ -1710,6 +2780,16 @@ def is_account_creation_complete():
     """Check if we've completed account creation and reached the main Instagram screen"""
     try:
         page_source = driver.page_source
+
+        # IMPORTANT: First check if we're still on profile picture screen
+        # Instagram shows bottom nav even during profile picture step, so check this first
+        try:
+            profile_pic_elements = driver.find_element(By.XPATH, '//*[@label="Add picture" or @label="Skip" or contains(@label, "Add a profile picture")]')
+            if profile_pic_elements:
+                print("Still on profile picture screen - NOT complete yet")
+                return False
+        except:
+            pass
 
         # Check for main Instagram elements (Home, Search, Profile tabs)
         try:
@@ -1886,8 +2966,35 @@ def createAccount(key):
                 if create_account_button.is_enabled():
                     create_account_button.click()
                     print(f"Clicked on 'Create new account' (Attempt {attempt + 1})")
-                    random_delay(1, 3)
-                    break
+
+                    # Wait and verify we moved to next screen (mobile number or email screen)
+                    print("Verifying page transition after clicking Create new account...")
+                    page_changed = False
+                    for verify_attempt in range(5):  # Check for 5 seconds
+                        time.sleep(1)
+                        try:
+                            # Check if we're on mobile number or email screen
+                            driver.find_element(By.XPATH, '//*[@label="Mobile number" or @label="Mobile Number" or @label="Email address" or @label="Email"]')
+                            print(f"✓ Page transitioned to signup screen after {verify_attempt + 1} seconds")
+                            page_changed = True
+                            break
+                        except:
+                            # Also check for "Continue creating account" button
+                            try:
+                                driver.find_element(By.XPATH, '//*[@label="Continue creating account"]')
+                                print(f"✓ 'Continue creating account' screen appeared after {verify_attempt + 1} seconds")
+                                page_changed = True
+                                break
+                            except:
+                                if verify_attempt < 4:
+                                    print(f"Still on same page... ({verify_attempt + 1}/5)")
+
+                    if page_changed:
+                        print("Successfully moved to next screen")
+                        break
+                    else:
+                        print(f"⚠️  Page didn't change after clicking - button click may have failed")
+                        # Continue to retry
                 else:
                     print(f"'Create new account' button found but not enabled (Attempt {attempt + 1})")
             except Exception as e:
@@ -1908,6 +3015,33 @@ def createAccount(key):
         time.sleep(5)
     except:
         print("'Continue creating account' button not found, proceeding...")
+
+    # Check if Instagram is asking for email instead of mobile number
+    print("Checking if on email signup screen...")
+    for check_attempt in range(3):
+        try:
+            # Look for "Sign up with mobile number" button
+            mobile_signup_button = driver.find_element(By.XPATH, '//*[@label="Sign up with mobile number"]')
+            if mobile_signup_button.is_displayed():
+                print("Email signup screen detected. Clicking 'Sign up with mobile number'...")
+                mobile_signup_button.click()
+                print("Switched to mobile number signup")
+                time.sleep(2)
+                break
+        except:
+            # Button not found - either we're already on mobile number screen or still loading
+            try:
+                # Check if we're already on mobile number screen
+                mobile_field = driver.find_element(By.XPATH, '//*[@label="Mobile number" or @label="Mobile Number"]')
+                if mobile_field:
+                    print("Already on mobile number screen, proceeding...")
+                    break
+            except:
+                if check_attempt < 2:
+                    print(f"Neither email nor mobile screen found yet, waiting... (attempt {check_attempt + 1}/3)")
+                    time.sleep(2)
+                else:
+                    print("Could not determine signup method, proceeding with flow...")
 
     # Fixed step order - only detect if step fails
     real_username = None
@@ -1954,7 +3088,12 @@ def createAccount(key):
                 if retry_count >= 1:
                     print(f"Step {step_name} failed on previous attempt. Quick detection check...")
                     detected = detect_current_step()
-                    if detected and detected != step_name and detected != "complete":
+
+                    # If still on the same step, it means the Next button click failed - retry same step
+                    if detected == step_name:
+                        print(f"✓ Still on {step_name} screen - retrying same step (Next button may have failed)")
+                        # Continue to retry the same step - don't raise exception
+                    elif detected and detected != step_name and detected != "complete":
                         print(f"⚠️  Instagram changed order! Expected '{step_name}' but found '{detected}'")
                         # Handle the detected step instead
                         raise Exception(f"Step order changed - on {detected} instead of {step_name}")
@@ -1968,6 +3107,13 @@ def createAccount(key):
                     print(f"Step {step_name} requested restart")
                     return "restart"
 
+                if result == "human_verification_failed":
+                    print(f"\n{'='*60}")
+                    print(f"❌ HUMAN VERIFICATION DETECTED - Account flagged by Instagram")
+                    print(f"This account cannot be used - failing immediately")
+                    print(f"{'='*60}\n")
+                    return False  # Immediately fail the entire account creation
+
                 if result == False:
                     print(f"Step {step_name} failed, retrying...")
                     retry_count += 1
@@ -1980,19 +3126,99 @@ def createAccount(key):
 
                 # Step succeeded
                 print(f"✓ Step '{step_name}' completed successfully")
-                completed_steps.add(step_name)  # Track that this step is done
-                step_completed = True
 
                 # Wait for Instagram to load next page before proceeding
                 print("Waiting for next page to load...")
-                time.sleep(2)  # Give Instagram time to transition to next step
+                time.sleep(3)  # Give Instagram time to transition to next step
+
+                # Verify we actually moved off this screen (Next button might have failed)
+                # Skip extended verification for agree step - it handles its own retry
+                print(f"Verifying we moved off {step_name} screen...")
+                still_on_same_screen = False
+
+                if step_name == "agree":
+                    # Agree step handles its own retry, just do a quick check
+                    try:
+                        detected_after = detect_current_step()
+                        if detected_after == step_name:
+                            print(f"⚠️  Still on {step_name} screen - will retry")
+                            still_on_same_screen = True
+                        else:
+                            print(f"✓ Successfully moved off {step_name} screen (now on: {detected_after})")
+                    except:
+                        pass
+                else:
+                    # For other steps, do the full 15-second verification
+                    for verify_check in range(3):  # Check 3 times over 15 seconds total
+                        try:
+                            detected_after = detect_current_step()
+                            if detected_after == step_name:
+                                if verify_check < 2:
+                                    print(f"Still on {step_name} screen (check {verify_check + 1}/3), waiting 5 more seconds...")
+                                    time.sleep(5)
+                                    continue
+                                else:
+                                    print(f"⚠️  Still on {step_name} screen after 15 seconds - Next button click likely failed")
+                                    still_on_same_screen = True
+                                    break
+                            else:
+                                print(f"✓ Successfully moved off {step_name} screen (now on: {detected_after})")
+                                break
+                        except:
+                            # Detection failed, assume we moved on
+                            break
+
+                # If still on same screen, just retry clicking Next button (don't retype everything)
+                if still_on_same_screen:
+                    print(f"Page didn't transition - retrying Next button click...")
+
+                    # Just click Next button again without retyping
+                    try:
+                        next_button = driver.find_element(By.XPATH, '//*[@label="Next"]')
+                        if next_button.is_enabled():
+                            next_button.click()
+                            print(f"Clicked Next button again (retry without retyping)")
+                            time.sleep(3)
+
+                            # Check if page transitioned this time
+                            detected_after_retry = detect_current_step()
+                            if detected_after_retry != step_name:
+                                print(f"✓ Page transitioned after Next retry (now on: {detected_after_retry})")
+                                # Successfully completed after Next retry
+                                completed_steps.add(step_name)
+                                step_completed = True
+                                # Don't continue the loop, we're done with this step
+                            else:
+                                print(f"⚠️  Still on {step_name} after Next retry - will retry full step")
+                                retry_count += 1
+                                if retry_count < max_retry_per_step:
+                                    continue
+                                else:
+                                    print(f"❌ Failed to complete {step_name} after {max_retry_per_step} attempts")
+                                    step_completed = False
+                                    break
+                        else:
+                            print("Next button not enabled - retrying full step")
+                            retry_count += 1
+                            if retry_count < max_retry_per_step:
+                                continue
+                            else:
+                                step_completed = False
+                                break
+                    except Exception as e:
+                        print(f"Error clicking Next button: {e} - retrying full step")
+                        retry_count += 1
+                        if retry_count < max_retry_per_step:
+                            continue
+                        else:
+                            step_completed = False
+                            break
+                else:
+                    # Successfully completed and moved to next screen
+                    completed_steps.add(step_name)  # Track that this step is done
+                    step_completed = True
 
             except Exception as e:
-                # If this is a country detection exception, re-raise to trigger full restart
-                if "Non-US country detected" in str(e):
-                    print(f"Country detection exception in step {step_name}, propagating up...")
-                    raise
-
                 # Step failed - check if we're on a different screen
                 print(f"Error executing {step_name}: {str(e)}")
                 print("Detecting actual current step to see if order changed...")
@@ -2153,24 +3379,136 @@ def createAccount(key):
         print("Closing and reopening Instagram...")
         driver.terminate_app("com.burbn.instagram")
         driver.activate_app("com.burbn.instagram")
-        time.sleep(2)
+        time.sleep(3)
     else:
         print("Instagram already restarted during profile picture bypass, skipping restart")
 
-    # Handle notification popup
-    for _ in range(20):
+    # Wait 2 seconds before checking for popups to ensure they have time to appear
+    time.sleep(2)
+
+    # Handle notification popup (can be system alert OR Instagram in-app popup)
+    print("Checking for notifications popup...")
+    notifications_handled = False
+    for attempt in range(4):  # Only 4 attempts = max 2 seconds
+        print(f"  Notifications popup check attempt {attempt + 1}/4...")
+
+        # First check for Instagram in-app "Not Now" popup (most common after reopen)
+        # Using exact same XPath that works during link addition
         try:
-            not_now_button = driver.find_element(By.XPATH,
-                                                 '//*[@label="Not Now" or @label="Not now" or @name="Not Now" or @name="Not now"]')
+            not_now_button = driver.find_element(By.XPATH, '//*[@label="Not Now" or @label="Not now"]')
             not_now_button.click()
-            print("Clicked 'Not Now' on notification popup")
+            print("✓ Clicked 'Not Now' on Instagram notifications popup")
+            notifications_handled = True
+            time.sleep(0.5)
             break
         except:
             pass
 
+        try:
+            # Method 2: System alert "Don't Allow" button
+            dont_allow_button = driver.find_element(By.XPATH, "//*[@label=\"Don't Allow\"]")
+            dont_allow_button.click()
+            print("✓ Clicked 'Don't Allow' on notifications popup")
+            notifications_handled = True
+            time.sleep(0.5)
+            break
+        except:
+            pass
+
+        if attempt < 3:
+            time.sleep(0.5)
+
+    if not notifications_handled:
+        print("No notifications popup found")
+
+    # Handle cookies popup (second popup that can appear)
+    print("Checking for cookies popup...")
+    cookies_handled = False
+    for attempt in range(4):  # Only 4 attempts = max 2 seconds
+        print(f"  Cookies popup check attempt {attempt + 1}/4...")
+
+        try:
+            # Method 1: Any element with exact "Allow all cookies" label
+            allow_cookies_button = driver.find_element(By.XPATH, "//*[@label=\"Allow all cookies\"]")
+            allow_cookies_button.click()
+            print("✓ Clicked 'Allow all cookies' on cookies popup (Method 1: Any element)")
+            cookies_handled = True
+            time.sleep(0.5)
+            break
+        except:
+            pass
+
+        try:
+            # Method 2: Button with exact match
+            allow_cookies_button = driver.find_element(By.XPATH, "//XCUIElementTypeButton[@label=\"Allow all cookies\"]")
+            allow_cookies_button.click()
+            print("✓ Clicked 'Allow all cookies' on cookies popup (Method 2: Button)")
+            cookies_handled = True
+            time.sleep(0.5)
+            break
+        except:
+            pass
+
+        try:
+            # Method 3: Button containing "Allow" and "cookies"
+            allow_cookies_button = driver.find_element(By.XPATH, "//XCUIElementTypeButton[contains(@label, \"Allow\") and contains(@label, \"cookies\")]")
+            allow_cookies_button.click()
+            print("✓ Clicked 'Allow all cookies' on cookies popup (Method 3)")
+            cookies_handled = True
+            time.sleep(0.5)
+            break
+        except:
+            pass
+
+        try:
+            # Method 4: Static text "Allow all cookies"
+            allow_cookies_text = driver.find_element(By.XPATH, "//XCUIElementTypeStaticText[@label=\"Allow all cookies\"]")
+            allow_cookies_text.click()
+            print("✓ Clicked 'Allow all cookies' on cookies popup (Method 4: StaticText)")
+            cookies_handled = True
+            time.sleep(0.5)
+            break
+        except:
+            pass
+
+        try:
+            # Method 5: Using @name attribute
+            allow_cookies_button = driver.find_element(By.XPATH, "//*[@name=\"Allow all cookies\"]")
+            allow_cookies_button.click()
+            print("✓ Clicked 'Allow all cookies' on cookies popup (Method 5: name)")
+            cookies_handled = True
+            time.sleep(0.5)
+            break
+        except:
+            pass
+
+        try:
+            # Method 6: Accessibility identifier
+            allow_cookies_button = driver.find_element(By.ACCESSIBILITY_ID, "Allow all cookies")
+            allow_cookies_button.click()
+            print("✓ Clicked 'Allow all cookies' on cookies popup (Method 6: accessibility ID)")
+            cookies_handled = True
+            time.sleep(0.5)
+            break
+        except:
+            pass
+
+        if attempt < 3:
+            time.sleep(0.5)
+
+    if not cookies_handled:
+        print("No cookies popup found")
+
     # Add OnlyFans link to profile
     print("Adding OnlyFans link to profile...")
-    addOnlyFansLink()
+    link_added = addOnlyFansLink()
+
+    if not link_added:
+        print("\n" + "="*60)
+        print("❌ FAILED: OnlyFans link could not be added to profile")
+        print("Account creation ABORTED - will restart process")
+        print("="*60 + "\n")
+        return False
 
     print("Terminating Instagram before token retrieval")
     driver.terminate_app("com.burbn.instagram")
@@ -2267,7 +3605,12 @@ parser = argparse.ArgumentParser(description='Run Instagram bot on a specific de
 parser.add_argument('--device-index', type=int, required=True, help='Device index from devices.json')
 parser.add_argument('--config', type=str, default='devices.json', help='Path to devices config file')
 parser.add_argument('--api-key', type=str, help='DaisySMS API key (optional, will use default if not provided)')
+parser.add_argument('--ip-mode', type=str, default='potatso', choices=['potatso', 'mobile_data'], help='IP rotation mode: potatso or mobile_data')
 args = parser.parse_args()
+
+# Update IP rotation mode from command line argument
+IP_ROTATION_MODE = args.ip_mode
+print(f"IP rotation mode: {IP_ROTATION_MODE}")
 
 # Load device configuration
 print(f"Loading device config from {args.config}...")
@@ -2367,7 +3710,6 @@ else:
 # Run indefinitely - create accounts non-stop with WDA recovery
 account_count = 0
 successful_accounts = 0
-last_preventive_restart = 0
 
 while True:
     try:
@@ -2376,19 +3718,10 @@ while True:
         print(f"Starting account creation #{account_count}")
         print(f"{'='*60}\n")
 
-        # Preventive restart every 5 successful accounts
-        if successful_accounts - last_preventive_restart >= 5:
-            print("\n" + "🔄 "*30)
-            print(f"Preventive restart after {successful_accounts} successful accounts")
-            print(f"This prevents WDA memory issues and keeps the bot stable")
-            print("🔄 "*30 + "\n")
-            restart_driver_session(options)
-            last_preventive_restart = successful_accounts
-
         # Check WDA health before starting
         if not check_wda_health():
-            print("⚠️  WDA appears unhealthy, restarting proactively...")
-            restart_driver_session(options)
+            print("⚠️  WDA appears unhealthy, restarting...")
+            restart_driver_session(options, device_config)
 
         # Account creation with WDA crash recovery
         wda_retry_count = 0
@@ -2405,13 +3738,24 @@ while True:
                     wda_retry_count += 1
                     print(f"\n⚠️  WDA crash detected in account creation (retry {wda_retry_count}/{max_wda_retries})")
                     if wda_retry_count < max_wda_retries:
-                        restart_driver_session(options)
+                        restart_driver_session(options, device_config)
                         print("Retrying account creation after WDA restart...")
                         continue
                     else:
                         print("❌ Failed after maximum WDA recovery attempts")
                         raise Exception("Could not complete account creation after WDA restarts")
 
+                # Check if account creation failed
+                if result == False:
+                    print(f"\n{'='*60}")
+                    print(f"❌ Account creation failed - restarting process")
+                    print(f"{'='*60}\n")
+                    # Reset container and IP, then retry
+                    rotateIP()
+                    crane()
+                    continue  # Restart the account creation loop
+
+                # Account created successfully
                 rotateIP()
                 crane()
                 account_created = True
@@ -2427,7 +3771,7 @@ while True:
                     wda_retry_count += 1
                     print(f"\n⚠️  WDA crash during account creation (retry {wda_retry_count}/{max_wda_retries})")
                     if wda_retry_count < max_wda_retries:
-                        restart_driver_session(options)
+                        restart_driver_session(options, device_config)
                         print("Retrying account creation after WDA restart...")
                     else:
                         print("❌ Failed after maximum WDA recovery attempts")
@@ -2453,7 +3797,7 @@ while True:
             # Check if it was a WDA crash that wasn't caught
             if is_wda_crashed(e):
                 print("Detected uncaught WDA crash, restarting session...")
-                restart_driver_session(options)
+                restart_driver_session(options, device_config)
 
             rotateIP()
             crane()
@@ -2462,7 +3806,7 @@ while True:
             # Try one more WDA restart if recovery failed
             if is_wda_crashed(recovery_error):
                 try:
-                    restart_driver_session(options)
+                    restart_driver_session(options, device_config)
                 except:
                     print("⚠️  Could not restart WDA, will try again next iteration")
 

@@ -27,6 +27,9 @@ CONFIG_FILE = 'devices.json'
 LOGS_DIR = 'logs'
 WDA_DIR = '/Users/kevinpencu/Downloads/WebDriverAgent'
 
+# IP rotation mode: 'potatso' or 'mobile_data'
+IP_ROTATION_MODE = 'potatso'  # Default to potatso
+
 
 def load_config():
     """Load devices configuration"""
@@ -55,6 +58,34 @@ def get_next_ports(config):
         last_device['system_port'] + 1,
         last_device['mjpeg_port'] + 1
     )
+
+
+def cleanup_large_logs(max_size_mb=100):
+    """Delete log files larger than max_size_mb to prevent storage exhaustion"""
+    if not os.path.exists(LOGS_DIR):
+        return
+
+    deleted_count = 0
+    freed_space_mb = 0
+
+    try:
+        for filename in os.listdir(LOGS_DIR):
+            if filename.endswith('.log'):
+                filepath = os.path.join(LOGS_DIR, filename)
+                try:
+                    size_mb = os.path.getsize(filepath) / (1024 * 1024)
+                    if size_mb > max_size_mb:
+                        os.remove(filepath)
+                        deleted_count += 1
+                        freed_space_mb += size_mb
+                        print(f"  Deleted large log: {filename} ({size_mb:.1f} MB)")
+                except Exception as e:
+                    print(f"  Warning: Could not process {filename}: {e}")
+
+        if deleted_count > 0:
+            print(f"✓ Cleaned up {deleted_count} large log file(s), freed {freed_space_mb:.1f} MB")
+    except Exception as e:
+        print(f"Warning: Log cleanup error (non-fatal): {e}")
 
 
 def start_appium(port, device_name):
@@ -87,7 +118,7 @@ def start_bot(device_index, device_name):
         env['PYTHONUNBUFFERED'] = '1'
 
         process = subprocess.Popen(
-            ["python3", "-u", "run_device.py", "--device-index", str(device_index)],
+            ["python3", "-u", "run_device.py", "--device-index", str(device_index), "--ip-mode", IP_ROTATION_MODE],
             stdout=log_file,
             stderr=subprocess.STDOUT,
             preexec_fn=os.setsid,
@@ -296,6 +327,10 @@ def start_device(device_index):
     print(f"Starting {device['name']}...")
     print(f"{'='*60}")
 
+    # Step 0: Clean up large log files to prevent storage exhaustion
+    print(f"[0/5] Cleaning up large log files...")
+    cleanup_large_logs(max_size_mb=100)
+
     # Step 1: Start iproxy (port forwarding)
     print(f"[1/5] Starting iproxy...")
     iproxy_process = start_iproxy(device)
@@ -473,6 +508,24 @@ def get_device_logs(device_index):
         return jsonify({'logs': f'Error reading logs: {str(e)}'})
 
 
+@app.route('/api/logs/cleanup', methods=['POST'])
+def cleanup_logs():
+    """Manually clean up large log files"""
+    try:
+        max_size_mb = request.json.get('max_size_mb', 100) if request.json else 100
+
+        print(f"\n{'='*60}")
+        print(f"Manual log cleanup requested (files > {max_size_mb}MB)")
+        print(f"{'='*60}")
+
+        cleanup_large_logs(max_size_mb=max_size_mb)
+
+        print(f"{'='*60}\n")
+        return jsonify({'success': True})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
 @app.route('/api/shutdown', methods=['POST'])
 def shutdown():
     """Shutdown all processes"""
@@ -593,6 +646,28 @@ if __name__ == '__main__':
 
     print("="*60)
     print("Instagram Bot Dashboard Starting...")
+    print("="*60)
+
+    # Ask user to choose IP rotation mode
+    print("\nSelect IP rotation mode:")
+    print("  1. Mobile Data (uses Shortcuts to toggle airplane mode)")
+    print("  2. Potatso Proxies (switches between proxy servers)")
+    print("")
+
+    while True:
+        choice = input("Enter your choice (1 or 2): ").strip()
+        if choice == "1":
+            globals()['IP_ROTATION_MODE'] = "mobile_data"
+            print("✓ Selected: Mobile Data mode")
+            break
+        elif choice == "2":
+            globals()['IP_ROTATION_MODE'] = "potatso"
+            print("✓ Selected: Potatso Proxies mode")
+            break
+        else:
+            print("Invalid choice. Please enter 1 or 2.")
+
+    print("")
     print("="*60)
     print("\nOpen in browser: http://localhost:5000")
     print("\n⚠️  IMPORTANT: Closing this dashboard will automatically stop")
