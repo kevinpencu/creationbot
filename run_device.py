@@ -3112,7 +3112,7 @@ def createAccount(key):
                     print(f"❌ HUMAN VERIFICATION DETECTED - Account flagged by Instagram")
                     print(f"This account cannot be used - failing immediately")
                     print(f"{'='*60}\n")
-                    return False  # Immediately fail the entire account creation
+                    return "human_verification"  # Return distinct value for tracking
 
                 if result == False:
                     print(f"Step {step_name} failed, retrying...")
@@ -3622,6 +3622,21 @@ shared_config = config['shared_config']
 
 print(f"Starting bot for device: {device_config['name']} (UDID: {device_config['udid']})")
 
+
+def report_stat(stat_type):
+    """Report a stat to the dashboard (successful, confirm_human, or failed)"""
+    try:
+        response = requests.post(
+            f"http://127.0.0.1:5000/api/device/{args.device_index}/stats/update",
+            json={'type': stat_type},
+            timeout=2
+        )
+        if response.status_code == 200:
+            print(f"Reported stat: {stat_type}")
+    except Exception as e:
+        # Don't fail if dashboard is not running
+        pass
+
 # Build desired capabilities from config
 desired_caps = {
     "platformName": shared_config["platformName"],
@@ -3745,11 +3760,23 @@ while True:
                         print("❌ Failed after maximum WDA recovery attempts")
                         raise Exception("Could not complete account creation after WDA restarts")
 
+                # Check if human verification was triggered
+                if result == "human_verification":
+                    print(f"\n{'='*60}")
+                    print(f"❌ Human verification detected - restarting process")
+                    print(f"{'='*60}\n")
+                    report_stat('confirm_human')
+                    # Reset container and IP, then retry
+                    rotateIP()
+                    crane()
+                    continue  # Restart the account creation loop
+
                 # Check if account creation failed
                 if result == False:
                     print(f"\n{'='*60}")
                     print(f"❌ Account creation failed - restarting process")
                     print(f"{'='*60}\n")
+                    report_stat('failed')
                     # Reset container and IP, then retry
                     rotateIP()
                     crane()
@@ -3760,6 +3787,7 @@ while True:
                 crane()
                 account_created = True
                 successful_accounts += 1
+                report_stat('successful')
 
                 print(f"\n{'='*60}")
                 print(f"✓ Successfully created account #{account_count}")

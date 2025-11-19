@@ -20,6 +20,9 @@ app = Flask(__name__)
 # Store running processes by UDID for reliability (not affected by index changes)
 processes = {}  # {udid: {'iproxy': process, 'wda': process, 'appium': process, 'bot': process}}
 
+# Store device stats (resets when dashboard restarts)
+device_stats = {}  # {device_index: {'successful': 0, 'confirm_human': 0, 'failed': 0}}
+
 # Flag to prevent multiple cleanup calls
 _cleanup_in_progress = False
 
@@ -258,12 +261,16 @@ def get_devices():
             elif iproxy_running or wda_running or appium_running:
                 status = 'starting'
 
+        # Get stats for this device (default to zeros if not exists)
+        stats = device_stats.get(idx, {'successful': 0, 'confirm_human': 0, 'failed': 0})
+
         devices_with_status.append({
             'index': idx,
             'name': device['name'],
             'udid': device['udid'],
             'appium_port': device['appium_port'],
-            'status': status
+            'status': status,
+            'stats': stats
         })
 
     return jsonify(devices_with_status)
@@ -506,6 +513,32 @@ def get_device_logs(device_index):
         return jsonify({'logs': '📋 No logs yet.\n\nClick Start to begin account creation.'})
     except Exception as e:
         return jsonify({'logs': f'Error reading logs: {str(e)}'})
+
+
+@app.route('/api/device/<int:device_index>/stats/update', methods=['POST'])
+def update_device_stats(device_index):
+    """Update stats for a device (called by the bot)"""
+    data = request.json
+    stat_type = data.get('type')  # 'successful', 'confirm_human', or 'failed'
+
+    if stat_type not in ['successful', 'confirm_human', 'failed']:
+        return jsonify({'success': False, 'error': 'Invalid stat type'}), 400
+
+    # Initialize stats for this device if not exists
+    if device_index not in device_stats:
+        device_stats[device_index] = {'successful': 0, 'confirm_human': 0, 'failed': 0}
+
+    # Increment the stat
+    device_stats[device_index][stat_type] += 1
+
+    return jsonify({'success': True, 'stats': device_stats[device_index]})
+
+
+@app.route('/api/device/<int:device_index>/stats', methods=['GET'])
+def get_device_stats(device_index):
+    """Get stats for a device"""
+    stats = device_stats.get(device_index, {'successful': 0, 'confirm_human': 0, 'failed': 0})
+    return jsonify(stats)
 
 
 @app.route('/api/logs/cleanup', methods=['POST'])

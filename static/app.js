@@ -44,6 +44,7 @@ function createDeviceCard(device) {
     const statusText = device.status.charAt(0).toUpperCase() + device.status.slice(1);
     const isStopped = device.status === 'stopped';
     const isRunningOrStarting = device.status === 'running' || device.status === 'starting';
+    const stats = device.stats || {successful: 0, confirm_human: 0, failed: 0};
 
     return `
         <div class="device-card">
@@ -55,6 +56,20 @@ function createDeviceCard(device) {
                 <div><strong>UDID:</strong> ${device.udid.substring(0, 16)}...</div>
                 <div><strong>Port:</strong> ${device.appium_port}</div>
                 <div><strong>Status:</strong> ${statusText}</div>
+            </div>
+            <div class="device-stats">
+                <div class="stat-item stat-success">
+                    <span class="stat-label">Successful:</span>
+                    <span class="stat-value">${stats.successful}</span>
+                </div>
+                <div class="stat-item stat-warning">
+                    <span class="stat-label">Confirm Human:</span>
+                    <span class="stat-value">${stats.confirm_human}</span>
+                </div>
+                <div class="stat-item stat-danger">
+                    <span class="stat-label">Failed:</span>
+                    <span class="stat-value">${stats.failed}</span>
+                </div>
             </div>
             <div class="device-actions">
                 ${isRunningOrStarting ?
