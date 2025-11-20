@@ -23,6 +23,9 @@ processes = {}  # {udid: {'iproxy': process, 'wda': process, 'appium': process, 
 # Store device stats (resets when dashboard restarts)
 device_stats = {}  # {device_index: {'successful': 0, 'confirm_human': 0, 'failed': 0}}
 
+# Store detailed device stats (resets when dashboard restarts)
+detailed_stats = {}  # {device_index: {'successful': {'first_request': 0, 'second_request': 0, 'multiple_numbers': 0}, 'confirm_human': {...}}}
+
 # Flag to prevent multiple cleanup calls
 _cleanup_in_progress = False
 
@@ -520,6 +523,7 @@ def update_device_stats(device_index):
     """Update stats for a device (called by the bot)"""
     data = request.json
     stat_type = data.get('type')  # 'successful', 'confirm_human', or 'failed'
+    category = data.get('category')  # 'first_request', 'second_request', or 'multiple_numbers' (optional)
 
     if stat_type not in ['successful', 'confirm_human', 'failed']:
         return jsonify({'success': False, 'error': 'Invalid stat type'}), 400
@@ -528,8 +532,20 @@ def update_device_stats(device_index):
     if device_index not in device_stats:
         device_stats[device_index] = {'successful': 0, 'confirm_human': 0, 'failed': 0}
 
+    # Initialize detailed stats for this device if not exists
+    if device_index not in detailed_stats:
+        detailed_stats[device_index] = {
+            'successful': {'first_request': 0, 'second_request': 0, 'multiple_numbers': 0},
+            'confirm_human': {'first_request': 0, 'second_request': 0, 'multiple_numbers': 0}
+        }
+
     # Increment the stat
     device_stats[device_index][stat_type] += 1
+
+    # If category provided, update detailed stats (only for successful and confirm_human)
+    if category and stat_type in ['successful', 'confirm_human']:
+        if category in ['first_request', 'second_request', 'multiple_numbers']:
+            detailed_stats[device_index][stat_type][category] += 1
 
     return jsonify({'success': True, 'stats': device_stats[device_index]})
 
@@ -539,6 +555,16 @@ def get_device_stats(device_index):
     """Get stats for a device"""
     stats = device_stats.get(device_index, {'successful': 0, 'confirm_human': 0, 'failed': 0})
     return jsonify(stats)
+
+
+@app.route('/api/device/<int:device_index>/stats/detailed', methods=['GET'])
+def get_device_detailed_stats(device_index):
+    """Get detailed stats for a device"""
+    detailed = detailed_stats.get(device_index, {
+        'successful': {'first_request': 0, 'second_request': 0, 'multiple_numbers': 0},
+        'confirm_human': {'first_request': 0, 'second_request': 0, 'multiple_numbers': 0}
+    })
+    return jsonify(detailed)
 
 
 @app.route('/api/logs/cleanup', methods=['POST'])

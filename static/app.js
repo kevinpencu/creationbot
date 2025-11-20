@@ -77,6 +77,7 @@ function createDeviceCard(device) {
                     `<button class="btn btn-success" onclick="startDevice(${device.index})">▶ Start</button>`
                 }
                 <button class="btn btn-secondary" onclick="openLogs(${device.index}, '${device.name}')">📋 Logs</button>
+                <button class="btn btn-info" onclick="openDetailedStats(${device.index}, '${device.name}')">📊 Stats</button>
                 ${isStopped ?
                     `<button class="btn btn-danger btn-sm" onclick="deleteDevice(${device.index}, '${device.name}')">🗑️</button>` :
                     ''
@@ -252,6 +253,101 @@ async function handleAddDevice(e) {
     }
 }
 
+// Global state for detailed stats
+let currentStatsDevice = null;
+let statsRefreshInterval = null;
+
+// Open detailed stats modal
+async function openDetailedStats(deviceIndex, deviceName) {
+    currentStatsDevice = deviceIndex;
+    document.getElementById('detailedStatsTitle').textContent = `📊 Detailed Statistics: ${deviceName}`;
+    document.getElementById('detailedStatsModal').classList.add('active');
+
+    // Load stats immediately
+    await refreshDetailedStats();
+
+    // Auto-refresh stats every 2 seconds for live updates
+    statsRefreshInterval = setInterval(refreshDetailedStats, 2000);
+}
+
+// Close detailed stats modal
+function closeDetailedStatsModal() {
+    document.getElementById('detailedStatsModal').classList.remove('active');
+    currentStatsDevice = null;
+
+    if (statsRefreshInterval) {
+        clearInterval(statsRefreshInterval);
+        statsRefreshInterval = null;
+    }
+}
+
+// Refresh detailed stats
+async function refreshDetailedStats() {
+    if (currentStatsDevice === null) return;
+
+    try {
+        const response = await fetch(`/api/device/${currentStatsDevice}/stats/detailed`);
+        const stats = await response.json();
+
+        const container = document.getElementById('detailedStatsContent');
+        container.innerHTML = `
+            <div class="stats-section">
+                <h3 class="stats-section-title success-title">✅ Successful Accounts</h3>
+                <div class="stats-grid">
+                    <div class="stat-box success-box">
+                        <div class="stat-box-label">SMS Code from First Request</div>
+                        <div class="stat-box-value">${stats.successful.first_request}</div>
+                        <div class="stat-box-desc">Code received on first try, no issues</div>
+                    </div>
+                    <div class="stat-box success-box">
+                        <div class="stat-box-label">SMS Code from Second Request</div>
+                        <div class="stat-box-value">${stats.successful.second_request}</div>
+                        <div class="stat-box-desc">Had to click "Resend code" but same number worked</div>
+                    </div>
+                    <div class="stat-box success-box">
+                        <div class="stat-box-label">Used 2+ Phone Numbers</div>
+                        <div class="stat-box-value">${stats.successful.multiple_numbers}</div>
+                        <div class="stat-box-desc">First number failed, had to rent new number</div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="stats-section">
+                <h3 class="stats-section-title warning-title">⚠️ Confirm Human Accounts</h3>
+                <div class="stats-grid">
+                    <div class="stat-box warning-box">
+                        <div class="stat-box-label">SMS Code from First Request</div>
+                        <div class="stat-box-value">${stats.confirm_human.first_request}</div>
+                        <div class="stat-box-desc">Code received on first try, but got verify human</div>
+                    </div>
+                    <div class="stat-box warning-box">
+                        <div class="stat-box-label">SMS Code from Second Request</div>
+                        <div class="stat-box-value">${stats.confirm_human.second_request}</div>
+                        <div class="stat-box-desc">Had to resend code, then got verify human</div>
+                    </div>
+                    <div class="stat-box warning-box">
+                        <div class="stat-box-label">Used 2+ Phone Numbers</div>
+                        <div class="stat-box-value">${stats.confirm_human.multiple_numbers}</div>
+                        <div class="stat-box-desc">First number failed, then got verify human</div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="stats-analysis">
+                <h4>Analysis</h4>
+                <p>Track these statistics to determine if phone number quality affects "confirm human" rates.</p>
+                <ul>
+                    <li><strong>First Request:</strong> Highest quality - code arrives immediately</li>
+                    <li><strong>Second Request:</strong> Medium quality - needed resend but number works</li>
+                    <li><strong>Multiple Numbers:</strong> Lowest quality - first number completely failed</li>
+                </ul>
+            </div>
+        `;
+    } catch (error) {
+        console.error('Failed to load detailed stats:', error);
+    }
+}
+
 // Close modals when clicking outside
 window.onclick = function(event) {
     if (event.target.classList.contains('modal')) {
@@ -259,6 +355,8 @@ window.onclick = function(event) {
 
         if (event.target.id === 'logModal') {
             closeLogModal();
+        } else if (event.target.id === 'detailedStatsModal') {
+            closeDetailedStatsModal();
         }
     }
 }

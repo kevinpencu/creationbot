@@ -38,6 +38,10 @@ fake = Faker()
 # Global driver variable for WDA recovery
 driver = None
 
+# Global variables to track phone number attempts for detailed stats
+phone_numbers_tried = 0
+sms_requests_for_current_number = 0
+
 
 # Signal handler to catch why script is being killed
 def signal_handler(signum, frame):
@@ -899,9 +903,13 @@ def check_login_popup():
 
 
 def mobileNumber(key):
+    global phone_numbers_tried, sms_requests_for_current_number
     is_retry = False  # Track if we're retrying after a failed number
 
     while True:
+        # Increment phone number counter (each iteration tries a new number)
+        phone_numbers_tried += 1
+        sms_requests_for_current_number = 1  # Reset to 1 for each new number
         try:
             # Find mobile number field - try both possible labels
             mobile_field = None
@@ -1336,6 +1344,7 @@ def mobileNumber(key):
                             print("Could not click SMS resend button, treating as failed attempt")
                         else:
                             # Second attempt - wait another 30 seconds
+                            sms_requests_for_current_number = 2  # Track that we requested code a second time
                             print("Waiting for SMS code from DaisySMS (second attempt)...")
                             code = checkNumber(orderid, "daisy", key)
 
@@ -1482,6 +1491,9 @@ def mobileNumber(key):
             except:
                 print("Unable to get page source")
             random_delay()
+
+    # Log final tracking stats for this account's phone number attempts
+    print(f"Phone number tracking: {phone_numbers_tried} number(s) tried, {sms_requests_for_current_number} SMS request(s) for successful number")
     return True
 
 
@@ -3623,12 +3635,36 @@ shared_config = config['shared_config']
 print(f"Starting bot for device: {device_config['name']} (UDID: {device_config['udid']})")
 
 
-def report_stat(stat_type):
-    """Report a stat to the dashboard (successful, confirm_human, or failed)"""
+def report_stat(stat_type, phone_numbers=None, sms_requests=None):
+    """Report a stat to the dashboard (successful, confirm_human, or failed)
+
+    Args:
+        stat_type: 'successful', 'confirm_human', or 'failed'
+        phone_numbers: Number of phone numbers tried (for detailed stats)
+        sms_requests: Number of SMS requests for the successful number (for detailed stats)
+    """
     try:
+        payload = {'type': stat_type}
+
+        # Add detailed tracking if provided
+        if phone_numbers is not None and sms_requests is not None:
+            # Determine category based on priority:
+            # 1. Multiple numbers takes precedence
+            # 2. Second request if only one number but 2+ requests
+            # 3. First request otherwise
+            if phone_numbers >= 2:
+                category = 'multiple_numbers'
+            elif sms_requests >= 2:
+                category = 'second_request'
+            else:
+                category = 'first_request'
+
+            payload['category'] = category
+            print(f"Category: {category} (numbers: {phone_numbers}, requests: {sms_requests})")
+
         response = requests.post(
             f"http://127.0.0.1:5000/api/device/{args.device_index}/stats/update",
-            json={'type': stat_type},
+            json=payload,
             timeout=2
         )
         if response.status_code == 200:
@@ -3733,6 +3769,10 @@ while True:
         print(f"Starting account creation #{account_count}")
         print(f"{'='*60}\n")
 
+        # Reset phone number tracking for this account attempt (already global variables)
+        phone_numbers_tried = 0
+        sms_requests_for_current_number = 0
+
         # Check WDA health before starting
         if not check_wda_health():
             print("⚠️  WDA appears unhealthy, restarting...")
@@ -3765,7 +3805,7 @@ while True:
                     print(f"\n{'='*60}")
                     print(f"❌ Human verification detected - restarting process")
                     print(f"{'='*60}\n")
-                    report_stat('confirm_human')
+                    report_stat('confirm_human', phone_numbers_tried, sms_requests_for_current_number)
                     # Reset container and IP, then retry
                     rotateIP()
                     crane()
@@ -3787,7 +3827,7 @@ while True:
                 crane()
                 account_created = True
                 successful_accounts += 1
-                report_stat('successful')
+                report_stat('successful', phone_numbers_tried, sms_requests_for_current_number)
 
                 print(f"\n{'='*60}")
                 print(f"✓ Successfully created account #{account_count}")
