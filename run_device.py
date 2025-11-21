@@ -681,14 +681,26 @@ def crane():
 
         # Wait for IP rotation (airplane mode on/off) and container name popup to appear
         print("Waiting for IP rotation (airplane mode toggle) and container name popup...")
-        time.sleep(5)  # Wait 5 seconds for airplane mode cycle (3s on + buffer) before popup appears
 
         # Get next container number for this device
         container_number = get_next_container_number(device_config['udid'])
 
-        # Find text input field and enter container number
+        # Actively search for text input field (wait as long as needed - no timeout)
+        print("Scanning for container name popup...")
+        text_field = None
+        attempt = 0
+        while text_field is None:
+            attempt += 1
+            try:
+                text_field = driver.find_element(By.XPATH, '//XCUIElementTypeTextField')
+                print(f"✓ Container name popup found after {attempt} attempt(s)")
+            except:
+                if attempt % 5 == 0:  # Print status every 5 seconds
+                    print(f"Still waiting for container popup... ({attempt}s)")
+                time.sleep(1)
+
+        # Enter container number
         try:
-            text_field = driver.find_element(By.XPATH, '//XCUIElementTypeTextField')
             text_field.click()
             time.sleep(0.5)
             text_field.send_keys(str(container_number))
@@ -696,20 +708,35 @@ def crane():
             time.sleep(0.5)
         except Exception as e:
             print(f"Error entering container name: {e}")
+            print("Container creation failed - retrying...")
             driver.execute_script("mobile: pressButton", {"name": "home"})
-            return
+            time.sleep(2)
+            return crane()  # Retry the entire process
 
-        # Click "Done" button
-        try:
-            done_button = driver.find_element(By.XPATH, '//*[@label="Done"]')
-            done_button.click()
-            print("Clicked 'Done' button")
-            time.sleep(3)  # Wait 3 seconds for shortcut to complete
-            print("Container creation completed")
-        except Exception as e:
-            print(f"Error clicking Done button: {e}")
+        # Click "Done" button (wait for it if needed)
+        print("Looking for 'Done' button...")
+        done_clicked = False
+        done_attempt = 0
+        while not done_clicked and done_attempt < 30:  # Max 30 seconds
+            done_attempt += 1
+            try:
+                done_button = driver.find_element(By.XPATH, '//*[@label="Done"]')
+                done_button.click()
+                print("Clicked 'Done' button")
+                done_clicked = True
+            except:
+                if done_attempt % 5 == 0:
+                    print(f"Still waiting for 'Done' button... ({done_attempt}s)")
+                time.sleep(1)
+
+        if not done_clicked:
+            print("Failed to find 'Done' button after 30 seconds - retrying container creation")
             driver.execute_script("mobile: pressButton", {"name": "home"})
-            return
+            time.sleep(2)
+            return crane()  # Retry the entire process
+
+        time.sleep(3)  # Wait for shortcut to complete
+        print("Container creation completed")
 
         # Return to home screen
         driver.execute_script("mobile: pressButton", {"name": "home"})
