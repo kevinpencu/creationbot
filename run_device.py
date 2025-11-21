@@ -631,12 +631,11 @@ def get_next_container_number(udid):
 
 
 def crane():
-    """Create new Instagram container using iOS Shortcut"""
-    print("Creating new container using Shortcut...")
+    """Rotate IP and create new Instagram container using combined iOS Shortcut"""
+    print("Rotating IP and creating new container using combined Shortcut...")
 
     try:
         # Always go to home and open Shortcuts to be safe
-        # (even in mobile_data mode, rotateIP might have failed)
         driver.execute_script("mobile: pressButton", {"name": "home"})
         time.sleep(1)
         print("Returned to home screen")
@@ -668,9 +667,8 @@ def crane():
             try:
                 ig_shortcut = driver.find_element(By.XPATH, '//*[@label="IG"]')
                 ig_shortcut.click()
-                print("Clicked on 'IG' shortcut")
+                print("Clicked on 'IG' shortcut (combined IP rotation + container)")
                 ig_clicked = True
-                time.sleep(2)
                 break
             except:
                 print(f"'IG' shortcut not found (attempt {attempt + 1}/{max_attempts}), waiting...")
@@ -681,9 +679,9 @@ def crane():
             driver.execute_script("mobile: pressButton", {"name": "home"})
             return
 
-        # Wait for container name popup to appear
-        print("Waiting for container name popup...")
-        time.sleep(2)
+        # Wait for IP rotation (airplane mode on/off) and container name popup to appear
+        print("Waiting for IP rotation (airplane mode toggle) and container name popup...")
+        time.sleep(5)  # Wait 5 seconds for airplane mode cycle (3s on + buffer) before popup appears
 
         # Get next container number for this device
         container_number = get_next_container_number(device_config['udid'])
@@ -718,7 +716,7 @@ def crane():
         time.sleep(1)
         print("Returned to home screen")
 
-        print("✓ Container reset completed successfully using Shortcut!")
+        print("✓ IP rotation and container reset completed successfully using combined Shortcut!")
 
     except Exception as e:
         print(f"Error during container reset: {e}")
@@ -2718,11 +2716,11 @@ def skip_profile_picture():
         print("Clicked 'Add picture'")
         time.sleep(2)
 
-        # Step 2: Click "Choose From Camera Roll"
+        # Step 2: Click "Choose From Camera Roll" (with capital or lowercase 'from')
         print("Looking for 'Choose From Camera Roll'...")
-        camera_roll_button = driver.find_element(By.XPATH, '//*[@label="Choose From Camera Roll"]')
+        camera_roll_button = driver.find_element(By.XPATH, '//*[@label="Choose From Camera Roll" or @label="Choose from Camera Roll"]')
         camera_roll_button.click()
-        print("Clicked 'Choose From Camera Roll'")
+        print("Clicked 'Choose From/from Camera Roll'")
         time.sleep(2)
 
         # Step 3: Click on "Albums" tab (starts on "Photos" tab by default)
@@ -3771,8 +3769,7 @@ while True:
         traceback.print_exc()
         time.sleep(0.5)
 
-rotateIP()
-print("Resetting container")
+print("Resetting IP and container (combined shortcut)")
 crane()
 print("Starting bot")
 
@@ -3836,8 +3833,7 @@ while True:
                     # Reset counters before retrying
                     phone_numbers_tried = 0
                     sms_requests_for_current_number = 0
-                    # Reset container and IP, then retry
-                    rotateIP()
+                    # Reset IP and container (combined shortcut), then retry
                     crane()
                     continue  # Restart the account creation loop
 
@@ -3850,13 +3846,11 @@ while True:
                     # Reset counters before retrying
                     phone_numbers_tried = 0
                     sms_requests_for_current_number = 0
-                    # Reset container and IP, then retry
-                    rotateIP()
+                    # Reset IP and container (combined shortcut), then retry
                     crane()
                     continue  # Restart the account creation loop
 
                 # Account created successfully
-                rotateIP()
                 crane()
                 account_created = True
                 successful_accounts += 1
@@ -3900,7 +3894,6 @@ while True:
                 print("Detected uncaught WDA crash, restarting session...")
                 restart_driver_session(options, device_config)
 
-            rotateIP()
             crane()
         except Exception as recovery_error:
             print(f"Error during recovery: {recovery_error}")
