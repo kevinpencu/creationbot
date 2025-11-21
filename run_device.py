@@ -3147,6 +3147,11 @@ def createAccount(key):
                     return "human_verification"  # Return distinct value for tracking
 
                 if result == False:
+                    # Special handling for mobile step with single number strategy
+                    if step_name == "mobile" and PHONE_NUMBER_STRATEGY == 'single':
+                        print(f"Mobile step failed with single number strategy - restarting entire account creation")
+                        return False  # Immediately restart account creation, don't retry step
+
                     print(f"Step {step_name} failed, retrying...")
                     retry_count += 1
 
