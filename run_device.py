@@ -22,6 +22,9 @@ import subprocess
 # Default IP rotation mode (will be overridden by command line argument)
 IP_ROTATION_MODE = 'potatso'
 
+# Default phone number strategy (will be overridden by command line argument)
+PHONE_NUMBER_STRATEGY = 'multiple'  # 'single' or 'multiple'
+
 # Try to import psutil for memory monitoring (optional)
 try:
     import psutil
@@ -1138,6 +1141,11 @@ def mobileNumber(key):
                 try:
                     driver.find_element(By.XPATH, '//*[@label="Create new account"]')
                     print("'Create new account' button found. Number likely already in use.")
+
+                    if PHONE_NUMBER_STRATEGY == 'single':
+                        print("Single number strategy enabled - restarting account creation")
+                        return False  # Restart entire account creation
+
                     is_retry = True
                     continue  # Retry with new number
                 except:
@@ -1172,7 +1180,13 @@ def mobileNumber(key):
                     time.sleep(1)
 
                 if not conf_field_found:
-                    print("Could not find confirmation code screen after waiting. Retrying with new number...")
+                    print("Could not find confirmation code screen after waiting.")
+
+                    if PHONE_NUMBER_STRATEGY == 'single':
+                        print("Single number strategy enabled - restarting account creation")
+                        return False  # Restart entire account creation
+
+                    print("Multiple number strategy - retrying with new number...")
                     is_retry = True
                     continue
 
@@ -1392,9 +1406,17 @@ def mobileNumber(key):
                     except Exception as e:
                         print(f"Error entering confirmation code: {e}")
                 else:
-                    # No code received after 2 attempts, cancel old number and rent new one
-                    print("No code received after 2 attempts. Cancelling old number and renting new one...")
+                    # No code received after 2 attempts
+                    print("No code received after 2 attempts.")
                     cancelNumber(orderid, "daisy", key)
+
+                    # Check phone number strategy
+                    if PHONE_NUMBER_STRATEGY == 'single':
+                        print("Single number strategy enabled - restarting account creation instead of trying new number")
+                        return False  # Restart entire account creation
+
+                    # Multiple number strategy - try a new number
+                    print("Multiple number strategy - renting new number...")
 
                     # Set retry flag so next attempt will clear the field
                     is_retry = True
@@ -3618,11 +3640,16 @@ parser.add_argument('--device-index', type=int, required=True, help='Device inde
 parser.add_argument('--config', type=str, default='devices.json', help='Path to devices config file')
 parser.add_argument('--api-key', type=str, help='DaisySMS API key (optional, will use default if not provided)')
 parser.add_argument('--ip-mode', type=str, default='potatso', choices=['potatso', 'mobile_data'], help='IP rotation mode: potatso or mobile_data')
+parser.add_argument('--phone-strategy', type=str, default='multiple', choices=['single', 'multiple'], help='Phone number strategy: single or multiple')
 args = parser.parse_args()
 
 # Update IP rotation mode from command line argument
 IP_ROTATION_MODE = args.ip_mode
 print(f"IP rotation mode: {IP_ROTATION_MODE}")
+
+# Update phone number strategy from command line argument
+PHONE_NUMBER_STRATEGY = args.phone_strategy
+print(f"Phone number strategy: {PHONE_NUMBER_STRATEGY}")
 
 # Load device configuration
 print(f"Loading device config from {args.config}...")

@@ -36,6 +36,9 @@ WDA_DIR = '/Users/kevinpencu/Downloads/WebDriverAgent'
 # IP rotation mode: 'potatso' or 'mobile_data'
 IP_ROTATION_MODE = 'potatso'  # Default to potatso
 
+# Phone number strategy: 'single' or 'multiple'
+PHONE_NUMBER_STRATEGY = 'multiple'  # Default to multiple
+
 
 def load_config():
     """Load devices configuration"""
@@ -124,7 +127,7 @@ def start_bot(device_index, device_name):
         env['PYTHONUNBUFFERED'] = '1'
 
         process = subprocess.Popen(
-            ["python3", "-u", "run_device.py", "--device-index", str(device_index), "--ip-mode", IP_ROTATION_MODE],
+            ["python3", "-u", "run_device.py", "--device-index", str(device_index), "--ip-mode", IP_ROTATION_MODE, "--phone-strategy", PHONE_NUMBER_STRATEGY],
             stdout=log_file,
             stderr=subprocess.STDOUT,
             preexec_fn=os.setsid,
@@ -722,6 +725,25 @@ if __name__ == '__main__':
         elif choice == "2":
             globals()['IP_ROTATION_MODE'] = "potatso"
             print("✓ Selected: Potatso Proxies mode")
+            break
+        else:
+            print("Invalid choice. Please enter 1 or 2.")
+
+    # Ask user to choose phone number strategy
+    print("\nSelect phone number strategy:")
+    print("  1. Single Number (only 1 number per account - restart if it fails)")
+    print("  2. Multiple Numbers (try new numbers until one works)")
+    print("")
+
+    while True:
+        choice = input("Enter your choice (1 or 2): ").strip()
+        if choice == "1":
+            globals()['PHONE_NUMBER_STRATEGY'] = "single"
+            print("✓ Selected: Single Number mode")
+            break
+        elif choice == "2":
+            globals()['PHONE_NUMBER_STRATEGY'] = "multiple"
+            print("✓ Selected: Multiple Numbers mode")
             break
         else:
             print("Invalid choice. Please enter 1 or 2.")
