@@ -3833,6 +3833,9 @@ while True:
                     print(f"❌ Human verification detected - restarting process")
                     print(f"{'='*60}\n")
                     report_stat('confirm_human', phone_numbers_tried, sms_requests_for_current_number)
+                    # Reset counters before retrying
+                    phone_numbers_tried = 0
+                    sms_requests_for_current_number = 0
                     # Reset container and IP, then retry
                     rotateIP()
                     crane()
@@ -3844,6 +3847,9 @@ while True:
                     print(f"❌ Account creation failed - restarting process")
                     print(f"{'='*60}\n")
                     report_stat('failed')
+                    # Reset counters before retrying
+                    phone_numbers_tried = 0
+                    sms_requests_for_current_number = 0
                     # Reset container and IP, then retry
                     rotateIP()
                     crane()
